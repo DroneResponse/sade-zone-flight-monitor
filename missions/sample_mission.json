@@ -1,0 +1,100 @@
+{
+  "states": [
+    {
+      "name": "Takeoff",
+      "transitions": [
+        {
+          "target": "Search-Region",
+          "condition": "succeeded_takeoff"
+        },
+        {
+          "target": "Land",
+          "condition": "failed_takeoff"
+        }
+      ]
+    },
+    {
+      "name": "Search-Region",
+      "class": "FlyWaypoints",
+      "args": {
+        "waypoints": [
+          {
+            "latitude": 41.6984606220894,
+            "longitude": -86.23703948325264,
+            "relative_altitude": 15.0
+          },
+          {
+            "latitude": 41.698345040610555,
+            "longitude": -86.23674689749379,
+            "relative_altitude": 15.0
+          },
+          {
+            "latitude": 41.69829580765684,
+            "longitude": -86.2375039695124,
+            "relative_altitude": 15.0
+          },
+          {
+            "latitude": 41.69805398433884,
+            "longitude": -86.23701278531549,
+            "relative_altitude": 15.0
+          },
+          {
+            "latitude": 41.69876812494381,
+            "longitude": -86.23706613998405,
+            "relative_altitude": 15.0
+          },
+          {
+            "latitude": 41.698688228464526,
+            "longitude": -86.2367736146215,
+            "relative_altitude": 15.0
+          },
+          {
+            "latitude": 41.69866344412571,
+            "longitude": -86.23750489364427,
+            "relative_altitude": 15.0
+          }
+        ],
+        "default_speed": 15.0,
+        "stare_pitch": 45.0
+      },
+      "transitions": [
+        {
+          "target": "GoHome",
+          "condition": "succeeded_waypoints"
+        }
+      ]
+    },
+    {
+      "name": "GoHome",
+      "class": "FlyHome",
+      "args": {
+        "speed": 12.0,
+        "stare_pitch": 45.0
+      },
+      "transitions": [
+        {
+          "condition": "succeeded_waypoints",
+          "target": "Land"
+        }
+      ]
+    },
+    {
+      "name": "Land",
+      "transitions": [
+        {
+          "target": "Disarm",
+          "condition": "succeeded_land"
+        }
+      ]
+    },
+    {
+      "name": "Disarm",
+      "transitions": [
+        {
+          "target": "mission_completed",
+          "condition": "succeeded_disarm"
+        }
+      ]
+    }
+  ]
+}

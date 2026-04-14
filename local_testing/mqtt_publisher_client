@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""Small reusable MQTT client wrapper for local testing.
+
+This module keeps MQTT setup simple for local publishers/subscribers while
+exposing a tiny API used by the drone simulator and the local end-to-end runner.
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+from typing import Callable, Optional
+
+import paho.mqtt.client as mqtt
+
+
+def _reason_code_to_int(reason_code) -> int:
+    """Convert Paho reason-code objects and integers into a plain int."""
+    if reason_code is None:
+        return 0
+
+    value = getattr(reason_code, "value", reason_code)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0 if str(reason_code) == "Success" else 1
+
+
+class MQTTClient:
+    """Minimal wrapper around Paho MQTT for local testing workflows."""
+
+    def __init__(self, broker: str, port: int, client_id: Optional[str] = None):
+        # Create a module logger so MQTT events can be written to console/log files.
+        self.logger = logging.getLogger(__name__)
+
+        # Use the newer callback API when available, while staying backwards compatible.
+        try:
+            self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=client_id)
+        except Exception:
+            self.client = mqtt.Client(client_id=client_id)
+
+        # Route Paho logs through Python logging for easier local debugging.
+        self.client.enable_logger(self.logger)
+
+        self.broker = broker
+        self.port = port
+
+        # Track connection state so callers can wait for readiness before publishing.
+        self._connected_event = threading.Event()
+
+        # Register connection lifecycle callbacks.
+        self.client.on_connect = self.on_connect
+        self.client.on_disconnect = self.on_disconnect
+
+    def connect(self) -> None:
+        """Connect to the MQTT broker and start Paho's network loop."""
+        try:
+            self.client.connect(self.broker, self.port)
+            self.client.loop_start()
+            self.logger.info("Connecting to MQTT broker at %s:%s", self.broker, self.port)
+        except Exception:
+            self.logger.exception("Failed to connect to MQTT broker at %s:%s", self.broker, self.port)
+            raise
+
+    def wait_until_connected(self, timeout: float = 5.0) -> bool:
+        """Wait briefly for the MQTT connection handshake to complete."""
+        return self._connected_event.wait(timeout=timeout)
+
+    def subscribe(self, topic: str, callback: Callable, qos: int = 1) -> None:
+        """Subscribe to a topic and attach a per-topic callback."""
+        self.client.message_callback_add(topic, callback)
+        self.client.subscribe(topic, qos=qos)
+        self.logger.debug("Subscribed to topic: %s", topic)
+
+    def publish(self, topic: str, message: str, qos: int = 1) -> None:
+        """Publish one message to the broker."""
+        info = self.client.publish(topic, message, qos=qos)
+        self.logger.debug("Published message to topic %s", topic)
+        info.wait_for_publish(timeout=2.0)
+
+    def stop(self) -> None:
+        """Stop the MQTT client cleanly."""
+        try:
+            self.client.loop_stop()
+            self.client.disconnect()
+        finally:
+            self._connected_event.clear()
+            self.logger.info("MQTT client stopped")
+
+    def on_connect(self, client, userdata, flags, reason_code, properties=None) -> None:
+        """Mark the client as connected after a successful broker handshake."""
+        _ = client, userdata, flags, properties
+        rc = _reason_code_to_int(reason_code)
+        if rc == 0:
+            self._connected_event.set()
+            self.logger.info("Connected to MQTT broker")
+        else:
+            self.logger.error("Failed to connect, return code: %s", reason_code)
+
+    def on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties=None) -> None:
+        """Clear connection state and log disconnect reason."""
+        _ = client, userdata, disconnect_flags, properties
+        self._connected_event.clear()
+        rc = _reason_code_to_int(reason_code)
+        if rc != 0:
+            self.logger.warning("Unexpected disconnect with error code %s", reason_code)
+        else:
+            self.logger.info("Disconnected from MQTT broker")

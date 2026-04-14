@@ -1,0 +1,40 @@
+# Python runtime artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Local test infrastructure (not needed in the container)
+local_testing/
+local_testing_recources/
+scripts/
+tests/
+missions/
+mission_running_scripts/
+
+# Old source layout (superseded by app/)
+reputation_row_creation/
+
+# Test and debug output
+local_test_output/
+*.log
+*.csv
+
+# Editor and OS noise
+.git/
+.gitignore
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Docs (not needed at runtime)
+SADE_AWS_API_INFORMATION/
+README.md

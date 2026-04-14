@@ -1,0 +1,153 @@
+Local MQTT Testing System Run Guide
+===================================
+
+Overview
+--------
+This local test setup runs the drone telemetry tracking flow end to end:
+1. Starts or reuses a local Mosquitto broker on localhost:1883
+2. Starts the telemetry ingestion pipeline
+3. Starts multiple fake drone publishers
+4. Processes telemetry through the MQTT topic -> asyncio queue -> async worker flow
+5. Tracks mission state in memory
+6. Writes one final mission row when a mission-finished message is received
+7. Logs queue-depth and latency metrics during the run
+8. Shuts down cleanly after the configured duration or on Ctrl+C
+
+Session Modes
+-------------
+The telemetry pipeline now supports two session modes:
+
+local
+- Default for local testing
+- Automatically creates a synthetic active session when a drone starts publishing telemetry
+- Keeps local development independent from the AWS entry-approval workflow
+
+aws
+- Intended for future AWS-integrated use
+- Telemetry is only processed for drones that already have an approved active session
+- Use this when the entry session listener / active session registry is being fed by AWS entry approvals
+
+Main Script
+-----------
+Run everything with:
+
+python3 /home/uav/drone-response/sade/run_local_test.py
+
+Useful Examples
+---------------
+Default local test run:
+
+python3 /home/uav/drone-response/sade/run_local_test.py
+
+Run for 30 seconds with 5 drones:
+
+python3 /home/uav/drone-response/sade/run_local_test.py --publisher-runtime-seconds 30 --drone-count 5
+
+Run faster publishing for a short smoke test:
+
+python3 /home/uav/drone-response/sade/run_local_test.py --publisher-runtime-seconds 10 --drone-count 2 --publish-interval 0.1
+
+Explicitly use local auto-session mode:
+
+python3 /home/uav/drone-response/sade/run_local_test.py --session-source-mode local
+
+Run the ingestion pipeline in AWS session mode:
+
+python3 /home/uav/drone-response/sade/run_local_test.py --session-source-mode aws
+
+Note: In aws mode, telemetry will be ignored unless an approved active session has already been registered for the drone.
+
+Key Options
+-----------
+--broker
+MQTT broker host. Default: localhost
+
+--port
+MQTT broker port. Default: 1883
+
+--topic
+Telemetry topic used by both publishers and ingestion. Default: update_drone
+
+--drone-count
+Number of fake drone publishers to start. Default: 3
+
+--publish-interval
+Seconds between telemetry messages per drone. Default: 0.1
+
+--publisher-runtime-seconds
+How long each simulated drone runs before sending its mission-complete message and stopping. Default: 20.0
+
+--group-size
+How many drones start in each launch group. Default: 3
+
+--group-stagger-seconds
+Seconds to wait before starting the next group of drones. Default: 0.0
+
+--session-source-mode
+How telemetry resolves active sessions.
+local = auto-create synthetic local sessions
+aws = only accept telemetry for pre-approved active sessions
+Default: local
+
+--metrics-log-interval
+Seconds between queue-depth and latency metric log lines.
+Default: 15.0
+
+--queue-size
+Maximum number of telemetry messages buffered in memory before new messages are dropped.
+Default: 10000
+
+--output-csv
+Path to the CSV file written by the ingestion pipeline.
+Default: /home/uav/drone-response/sade/local_test_output/mission_rows.csv
+
+--runner-log
+Path to the runner log file.
+Default: /home/uav/drone-response/sade/local_test_output/run_local_test.log
+
+--mosquitto-log
+Path to the Mosquitto log file if the script starts the broker.
+Default: /home/uav/drone-response/sade/local_test_output/mosquitto.log
+
+Output Files
+------------
+By default, files are written here:
+
+CSV results:
+/home/uav/drone-response/sade/local_test_output/mission_rows.csv
+
+Runner log:
+/home/uav/drone-response/sade/local_test_output/run_local_test.log
+
+Mosquitto log:
+/home/uav/drone-response/sade/local_test_output/mosquitto.log
+
+Current Local Flow
+------------------
+The current local flow is:
+
+fake drone publishes telemetry -> MQTT topic update_drone -> ingestion callback -> asyncio queue -> async worker -> active session resolution -> in-memory mission state tracking -> final mission row written on mission completion
+
+During the run, the pipeline also logs lightweight metrics including current queue depth, max queue depth, average/max queue wait latency, average/max worker processing time, dropped messages, and final mission rows written.
+
+Notes
+-----
+- The script uses localhost:1883.
+- If Mosquitto is already running on localhost:1883, the script reuses it.
+- Press Ctrl+C for a clean shutdown.
+- Fake drones publish realistic telemetry on the existing update_drone topic.
+- The default local mode is designed to keep testing simple even before AWS entry approval wiring is complete.
+
+Quick Troubleshooting
+---------------------
+If the script cannot start the broker:
+- Check that Mosquitto is installed and available in PATH.
+- Check whether another process is already using port 1883.
+
+If no CSV rows appear in local mode:
+- Confirm the ingestion topic and publisher topic are both update_drone.
+- Check the runner log and Mosquitto log in local_test_output.
+
+If no CSV rows appear in aws mode:
+- Confirm an approved active session was registered before telemetry arrived.
+- Remember that aws mode intentionally ignores telemetry for drones without an active approved session.
