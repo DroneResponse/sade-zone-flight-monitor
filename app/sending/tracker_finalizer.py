@@ -29,6 +29,9 @@ LOGGER = logging.getLogger(__name__)
 
 # Authoritative URL from the SADE API reference.
 # Defined here explicitly so the value stays visible and auditable.
+# TODO: This should be made configurable via an environment variable
+# (e.g. TRACKER_FINALIZED_URL) so deployments against different SADE
+# environments don't require a code change.
 TRACKER_FINALIZED_URL = (
     "http://sarec-sade-use2-api-alb-1413405053.us-east-2.elb.amazonaws.com"
     "/tracker-session-finalized"
@@ -71,15 +74,139 @@ def build_finalization_payload(state: DroneState) -> dict[str, Any]:
     }
 
 
+def build_stub_finalization_payload(
+    flight_session_id: str,
+    test_overrides: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the POST body for ``/tracker-session-finalized`` from test overrides.
+
+    Used when ``test_overrides`` is present on a registered session.  The
+    override dict is expected to carry ``actual_start_time``,
+    ``actual_end_time``, and an optional ``telemetry_summary`` — matching
+    the shape documented in FLIGHT_MONITOR_CONTRACT.md.
+
+    Missing fields are filled with safe defaults so the payload always
+    satisfies the SADE API contract.
+    """
+    telemetry = test_overrides.get("telemetry_summary") or {}
+
+    return {
+        "flight_session_id": flight_session_id,
+        "report_time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "actual_start_time": test_overrides.get("actual_start_time")
+            or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "actual_end_time": test_overrides.get("actual_end_time")
+            or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "telemetry_summary": {
+            "altitude_min_m": float(telemetry.get("altitude_min_m", 0.0)),
+            "altitude_max_m": float(telemetry.get("altitude_max_m", 0.0)),
+            "battery_start_pct": float(telemetry.get("battery_start_pct", 0.0)),
+            "battery_end_pct": float(telemetry.get("battery_end_pct", 0.0)),
+            "battery_voltage_start_v": float(telemetry.get("battery_voltage_start_v", 0.0)),
+            "battery_voltage_end_v": float(telemetry.get("battery_voltage_end_v", 0.0)),
+        },
+    }
+
+
+MAX_RETRIES = 2
+RETRY_BACKOFF_SECONDS = [1.0, 2.0]
+
+
 async def post_tracker_session_finalized(payload: dict[str, Any]) -> dict[str, Any] | None:
     """POST a finalization report to the SADE tracker-session-finalized endpoint.
 
-    The call is fire-and-log: the pipeline does not block further processing on
-    the response, but does log the full outcome so failures are visible.
+    Retries up to ``MAX_RETRIES`` times on transient failures (network errors
+    and HTTP 5xx) with exponential backoff.  HTTP 4xx errors and successful
+    business-level failures (e.g. ``status=FAILED``) are not retried because
+    the payload is either invalid or the session doesn't exist in SADE —
+    retrying won't change the outcome.
 
-    Returns the parsed JSON response body on HTTP 200, or None on any error.
-    The API is synchronous (HTTP 200, not 202) so the response carries the
-    final ``status`` (EXITED | FAILED) and ``reputation_record_id``.
+    Retrying is safe because SADE deduplicates finalization by
+    ``flight_session_id``.
+
+    Returns the parsed JSON response body on HTTP 200, or None after all
+    attempts are exhausted.
+    """
+    flight_session_id = payload.get("flight_session_id")
+
+    LOGGER.info(
+        "Sending tracker finalization POST for flight_session_id=%s actual_start=%s actual_end=%s",
+        flight_session_id,
+        payload.get("actual_start_time"),
+        payload.get("actual_end_time"),
+    )
+
+    last_error: Exception | None = None
+
+    for attempt in range(1 + MAX_RETRIES):
+        try:
+            result = await _attempt_post(payload)
+
+            LOGGER.info(
+                "POST %s → HTTP 200 | flight_session_id=%s | body=%s (attempt %d/%d)",
+                TRACKER_FINALIZED_URL,
+                flight_session_id,
+                json.dumps(result),
+                attempt + 1,
+                1 + MAX_RETRIES,
+            )
+            _log_finalization_response(result)
+            return result
+
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode(errors="replace")
+            LOGGER.error(
+                "POST %s → HTTP %s | flight_session_id=%s | body=%s (attempt %d/%d)",
+                TRACKER_FINALIZED_URL,
+                exc.code,
+                flight_session_id,
+                body,
+                attempt + 1,
+                1 + MAX_RETRIES,
+            )
+
+            # 4xx = client error, retrying won't help.
+            if 400 <= exc.code < 500:
+                return None
+
+            # 5xx = server error, worth retrying.
+            last_error = exc
+
+        except Exception as exc:
+            LOGGER.error(
+                "POST %s failed for flight_session_id=%s: %s (attempt %d/%d)",
+                TRACKER_FINALIZED_URL,
+                flight_session_id,
+                exc,
+                attempt + 1,
+                1 + MAX_RETRIES,
+            )
+            last_error = exc
+
+        # Back off before the next retry (skip sleep after the last attempt).
+        if attempt < MAX_RETRIES:
+            delay = RETRY_BACKOFF_SECONDS[min(attempt, len(RETRY_BACKOFF_SECONDS) - 1)]
+            LOGGER.info(
+                "Retrying finalization for flight_session_id=%s in %.1fs",
+                flight_session_id,
+                delay,
+            )
+            await asyncio.sleep(delay)
+
+    LOGGER.error(
+        "All %d finalization attempts failed for flight_session_id=%s. Last error: %s",
+        1 + MAX_RETRIES,
+        flight_session_id,
+        last_error,
+    )
+    return None
+
+
+async def _attempt_post(payload: dict[str, Any]) -> dict[str, Any]:
+    """Execute one blocking HTTP POST in a thread and return the parsed body.
+
+    Raises ``urllib.error.HTTPError`` on non-2xx responses and any other
+    exception on network/transport failures.
     """
     data = json.dumps(payload).encode()
     request = urllib.request.Request(
@@ -89,53 +216,11 @@ async def post_tracker_session_finalized(payload: dict[str, Any]) -> dict[str, A
         method="POST",
     )
 
-    LOGGER.info(
-        "Sending tracker finalization POST for flight_session_id=%s actual_start=%s actual_end=%s",
-        payload.get("flight_session_id"),
-        payload.get("actual_start_time"),
-        payload.get("actual_end_time"),
-    )
+    def _do_post() -> dict[str, Any]:
+        with urllib.request.urlopen(request, timeout=10) as resp:
+            return json.loads(resp.read())
 
-    try:
-        # urllib.request is blocking; run it in a thread so the asyncio event
-        # loop stays responsive while the HTTP round-trip completes.
-        def _do_post() -> tuple[int, dict]:
-            with urllib.request.urlopen(request, timeout=10) as resp:
-                return resp.status, json.loads(resp.read())
-
-        http_status, result = await asyncio.to_thread(_do_post)
-
-        # Log URL + HTTP status + full raw body so every integration run has a
-        # complete, auditable record of what the SADE endpoint returned.
-        LOGGER.info(
-            "POST %s → HTTP %s | flight_session_id=%s | body=%s",
-            TRACKER_FINALIZED_URL,
-            http_status,
-            payload.get("flight_session_id"),
-            json.dumps(result),
-        )
-        _log_finalization_response(result)
-        return result
-
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode(errors="replace")
-        LOGGER.error(
-            "POST %s → HTTP %s | flight_session_id=%s | body=%s",
-            TRACKER_FINALIZED_URL,
-            exc.code,
-            payload.get("flight_session_id"),
-            body,
-        )
-        return None
-
-    except Exception as exc:
-        LOGGER.error(
-            "POST %s failed for flight_session_id=%s: %s",
-            TRACKER_FINALIZED_URL,
-            payload.get("flight_session_id"),
-            exc,
-        )
-        return None
+    return await asyncio.to_thread(_do_post)
 
 
 def _log_finalization_response(result: dict[str, Any]) -> None:

@@ -1,0 +1,27 @@
+# Python runtime artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Test and debug output
+local_test_output/
+mission_rows.csv
+*.log
+.pytest_cache/
+
+# Claude Code project config
+.claude/
+
+# Editor and OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo

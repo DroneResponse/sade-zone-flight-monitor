@@ -1,0 +1,120 @@
+Integration Tests Guide
+======================
+
+These are standalone integration test scripts that start real servers and
+verify end-to-end behavior. Run them directly with Python from the sade/
+project root.
+
+
+test_mqtt_telemetry_pipeline.py
+-------------------------------
+What it tests:
+  The full MQTT telemetry monitoring path. Starts a Mosquitto broker, a
+  FastAPI session registration server, and the MQTT ingestion pipeline.
+  Registers fake drones via HTTP, publishes simulated MQTT telemetry, and
+  verifies that mission summary rows are written to CSV when each drone
+  completes its mission.
+
+Components involved:
+  Mosquitto broker, FastAPI server, MQTT pipeline, fake drone publishers,
+  CSV writer.
+
+Prerequisites:
+  Mosquitto must be installed and available in PATH (or already running on
+  localhost:1883).
+
+How to run:
+  python tests/integration/test_mqtt_telemetry_pipeline.py
+
+Examples:
+  # Default: 3 drones, 20 seconds each
+  python tests/integration/test_mqtt_telemetry_pipeline.py
+
+  # Quick smoke test: 2 drones, 10 seconds, fast publish rate
+  python tests/integration/test_mqtt_telemetry_pipeline.py --drone-count 2 --publisher-runtime-seconds 10 --publish-interval 0.1
+
+  # 5 drones, 30 seconds each
+  python tests/integration/test_mqtt_telemetry_pipeline.py --drone-count 5 --publisher-runtime-seconds 30
+
+Output:
+  CSV results:  local_test_output/mission_rows.csv
+  Runner log:   local_test_output/run_local_test.log
+  Broker log:   local_test_output/mosquitto.log
+
+Run --help for all available options.
+
+
+test_stub_finalization_override.py
+----------------------------------
+What it tests:
+  The test_overrides HTTP stub path. When a session is registered with
+  test_overrides present, the Flight Monitor skips real MQTT telemetry
+  and instead waits 5 seconds, then POSTs a canned finalization report
+  to the SADE API built from the override data.
+
+Components involved:
+  FastAPI server only. No MQTT broker or pipeline needed.
+
+Prerequisites:
+  None (no external services required).
+
+How to run:
+  python tests/integration/test_stub_finalization_override.py
+
+Examples:
+  # Default: 3 stub sessions
+  python tests/integration/test_stub_finalization_override.py
+
+  # 5 stub sessions
+  python tests/integration/test_stub_finalization_override.py --session-count 5
+
+What it verifies:
+  - Sessions register with HTTP 202
+  - Health endpoint shows correct active session count
+  - After 5-second stub delay, finalization POSTs fire
+  - All sessions cleaned up (health shows 0)
+  - Reports PASSED/FAILED at the end
+
+
+test_exit_request_grace_period.py
+---------------------------------
+What it tests:
+  The exit-request grace period lifecycle. When SADE notifies the Flight
+  Monitor that a drone is leaving a zone early, the system keeps monitoring
+  for telemetry silence before finalizing. Uses shortened grace period
+  constants (10s instead of 5 minutes) so the test completes quickly.
+
+Components involved:
+  FastAPI server only. No MQTT broker or pipeline needed.
+
+Prerequisites:
+  None (no external services required).
+
+How to run:
+  python tests/integration/test_exit_request_grace_period.py
+
+Scenarios tested:
+  1. Basic grace period — register, exit, verify session active during
+     grace, wait for silence, verify cleanup
+  2. Session not found — exit request for unknown session returns 404
+  3. Natural completion during grace — simulates worker finalizing the
+     session mid-grace, verifies grace task exits cleanly
+  4. Multiple simultaneous exits — 3 grace periods run independently
+
+What it verifies:
+  - Exit requests return HTTP 202 (accepted) or 404 (not found)
+  - Sessions stay active during the grace period
+  - Sessions finalize and clean up after the silence threshold
+  - Grace task handles natural completion without double-finalizing
+  - Reports PASSED/FAILED for each scenario
+
+
+General Notes
+-------------
+- All three scripts exit with code 0 on success, 1 on failure.
+- The SADE finalization POST targets the real AWS endpoint. In local
+  testing those flight_session_ids don't exist in SADE, so the API
+  returns a business failure — this is expected and not a test failure.
+- The CancelledError traceback at the end of each test is normal
+  uvicorn shutdown noise, not an error.
+- Unit tests live in tests/unit/ and are run with: pytest tests/unit/

@@ -51,7 +51,10 @@ ENV API_HOST=0.0.0.0 \
     API_PORT=8000
 
 # ── Expose ────────────────────────────────────────────────────────────────────
-# FastAPI webhook server (POST /entry-approval, GET /health).
+# FastAPI webhook server:
+#   POST /flight-monitor/register-session  (session registration)
+#   POST /flight-monitor/exit-request      (exit notification)
+#   GET  /health                           (liveness check)
 EXPOSE 8000
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────

@@ -22,9 +22,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-REPO_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_DIR = REPO_ROOT / "local_test_output"
-RUN_LOCAL_TEST = REPO_ROOT / "run_local_test.py"
+RUN_LOCAL_TEST = REPO_ROOT / "tests" / "integration" / "test_mqtt_telemetry_pipeline.py"
 SUMMARY_PATH = OUTPUT_DIR / "worker_comparison_summary.txt"
 
 SHUTDOWN_METRICS_PATTERN = re.compile(

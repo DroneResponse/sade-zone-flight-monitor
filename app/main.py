@@ -212,7 +212,7 @@ async def idle_message_watchdog(
 async def run_pipeline(args: argparse.Namespace) -> None:
     """Create and run the telemetry pipeline until interrupted."""
     queue: asyncio.Queue[dict[str, object]] = asyncio.Queue(maxsize=args.queue_size)
-    state_tracker = DroneStateTracker()
+    state_tracker = getattr(args, "state_tracker", None) or DroneStateTracker()
     row_writer = MissionCsvWriter(out_path=args.out)
     row_builder = MissionRowBuilder()
     metrics = PipelineMetrics()
@@ -328,9 +328,10 @@ async def run_pipeline(args: argparse.Namespace) -> None:
 async def run_service(args: argparse.Namespace) -> None:
     """Run the FastAPI webhook server and the MQTT pipeline together.
 
-    Both components share the same ``ActiveSessionRegistry`` instance so that
-    drones approved via ``POST /entry-approval`` are immediately visible to the
-    telemetry workers without any IPC.
+    Both components share the same ``ActiveSessionRegistry`` and
+    ``DroneStateTracker`` instances so that sessions registered or exited
+    via the API are immediately visible to the telemetry workers (and vice
+    versa) without any IPC.
 
     This is the production / container startup path.  Local testing uses
     ``run_pipeline()`` directly and manages uvicorn separately.
@@ -339,10 +340,12 @@ async def run_service(args: argparse.Namespace) -> None:
 
     from app.api.server import app as fastapi_app
     from app.api.server import registry as api_registry
+    from app.api.server import state_tracker as api_state_tracker
 
-    # Inject the API module's registry into the pipeline args so both halves
-    # share the same in-memory session state.
+    # Inject the API module's shared instances into the pipeline args so both
+    # the API server and the MQTT workers share the same in-memory state.
     args.session_registry = api_registry
+    args.state_tracker = api_state_tracker
 
     # Force aws session mode when the approval API is running — the API is the
     # gate; the pipeline should only accept pre-registered sessions.

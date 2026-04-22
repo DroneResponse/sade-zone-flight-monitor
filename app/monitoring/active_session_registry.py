@@ -28,7 +28,7 @@ class ActiveFlightSession:
     """
 
     flight_session_id: str
-    evaluation_series_id: str
+    evaluation_series_id: str = ""
     drone_id: str | None = None
     pilot_id: str | None = None
     organization_id: str | None = None
@@ -40,6 +40,9 @@ class ActiveFlightSession:
     notification_topic: str | None = None
     session_source: str = "aws"
     constraints: dict[str, Any] | None = None
+    requested_operation: dict[str, Any] | None = None
+    test_overrides: dict[str, Any] | None = None
+    submitted_at: str | None = None
     source_payload: dict[str, Any] = field(default_factory=dict)
     registered_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
