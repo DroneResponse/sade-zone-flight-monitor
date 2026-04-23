@@ -635,24 +635,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    # FastAPI webhook server (approval API)
+    # FastAPI webhook server
     parser.add_argument(
         "--api-host",
         default="127.0.0.1",
-        help="Host for the FastAPI entry-approval webhook server",
+        help="Host for the FastAPI flight-monitor webhook server",
     )
     parser.add_argument(
         "--api-port",
         type=int,
         default=8000,
-        help="Port for the FastAPI entry-approval webhook server",
+        help="Port for the FastAPI flight-monitor webhook server",
     )
     parser.add_argument(
         "--skip-approval-api",
         action="store_true",
         default=False,
         help=(
-            "Disable the FastAPI entry-approval flow and revert to the original "
+            "Disable the FastAPI flight-monitor registration flow and revert to the original "
             "'local' session mode where the pipeline auto-creates sessions. "
             "Use this when you want the old behaviour without the HTTP layer."
         ),

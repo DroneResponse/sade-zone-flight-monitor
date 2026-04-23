@@ -109,10 +109,6 @@ Notifies the Flight Monitor that a drone has left the zone early (or the session
 - If the drone sends a terminal MQTT status during the grace period, the normal worker path finalizes and the grace task exits cleanly.
 - If no telemetry was ever received, a finalization with an empty telemetry summary is still sent so SADE can close the session.
 
-### `POST /entry-approval`  — deprecated
-
-Original entry-approval webhook, kept for backward compatibility during migration. Logs a deprecation warning on every call. Will be removed once all callers are on the contract endpoint.
-
 ### `GET /health`
 
 Returns `{"status": "ok", "active_sessions": <count>}`.
@@ -274,7 +270,6 @@ docker run -d --restart unless-stopped \
 `8000` — FastAPI webhook server:
 - `POST /flight-monitor/register-session`
 - `POST /flight-monitor/exit-request`
-- `POST /entry-approval` (deprecated)
 - `GET /health`
 
 ### AWS deployment notes
@@ -301,8 +296,8 @@ sade/
 │   ├── main.py                     # Wires all components, parses args, runs the combined service
 │   │
 │   ├── api/
-│   │   ├── server.py               # FastAPI app — register-session, exit-request, (deprecated) entry-approval, /health
-│   │   ├── approval_handler.py     # Pydantic models + logic for register-session and legacy entry-approval
+│   │   ├── server.py               # FastAPI app — register-session, exit-request, /health
+│   │   ├── approval_handler.py     # Pydantic model + logic for register-session
 │   │   └── exit_handler.py         # Pydantic model + logic for exit-request events
 │   │
 │   ├── ingestion/
@@ -398,9 +393,6 @@ On `exit-request`, the session is NOT removed up front — it stays in the regis
 
 **Authentication on the webhook endpoints**
 `/flight-monitor/register-session` and `/flight-monitor/exit-request` have no auth. Any caller that can reach the port can register or close out a session. For production, this needs at minimum a shared secret header check, ideally mTLS or IAM-signed requests depending on the deployment environment.
-
-**Remove the deprecated `/entry-approval` endpoint**
-Kept for backward compatibility during migration to the contract-aligned `/flight-monitor/register-session`. Once all callers are on the new endpoint, `/entry-approval`, its handler, and its tests can be removed.
 
 **Battery percentage fields**
 `battery_start_pct` and `battery_end_pct` are sent as `0.0` in every finalization report built from real telemetry. The current telemetry payload only carries voltage, not percentage. Either the drone firmware needs to add a percentage field, or the service needs a voltage-to-percentage conversion curve per battery type.

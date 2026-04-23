@@ -1,6 +1,6 @@
 """FastAPI server for SADE Flight Monitor session lifecycle.
 
-Primary endpoints:
+Endpoints:
   POST /flight-monitor/register-session
     Receives session registration commands from the SADE outbox per the
     FLIGHT_MONITOR_CONTRACT.md integration contract.  Once registered, the
@@ -10,11 +10,6 @@ Primary endpoints:
     Receives exit notifications from SADE when a drone leaves a zone early
     or a session needs to be closed out.  Triggers finalization with whatever
     telemetry has been accumulated.
-
-Deprecated endpoint (kept for backward compatibility):
-  POST /entry-approval
-    Original entry-approval webhook. Logs a deprecation warning on every call.
-    Will be removed once all callers migrate to the contract endpoint.
 
 ─── Standalone (API only, no MQTT pipeline) ───────────────────────────────────
     uvicorn app.api.server:app --host 0.0.0.0 --port 8000 --reload
@@ -35,9 +30,7 @@ from fastapi.responses import JSONResponse
 from app.monitoring.active_session_registry import ActiveSessionRegistry
 from app.monitoring.state_tracker import DroneStateTracker
 from app.api.approval_handler import (
-    EntryApprovalPayload,
     RegisterSessionPayload,
-    process_approval,
     process_register_session,
 )
 from app.api.exit_handler import ExitRequestPayload, process_exit_request
@@ -363,39 +356,6 @@ async def exit_request(
 
     # Session not found — return 404.
     return JSONResponse(content=result, status_code=404)
-
-
-@app.post(
-    "/entry-approval",
-    summary="[Deprecated] Receive a SADE entry approval event",
-    response_description=(
-        "A JSON object describing the action taken: "
-        "'registered' (session activated), "
-        "'ignored' (non-approved decision), or "
-        "'rejected' (validation error, e.g. duplicate session)."
-    ),
-    status_code=200,
-    deprecated=True,
-)
-async def entry_approval(
-    payload: EntryApprovalPayload,
-    reg: ActiveSessionRegistry = Depends(get_registry),
-) -> JSONResponse:
-    """Deprecated -- use ``POST /flight-monitor/register-session`` instead.
-
-    This endpoint is kept for backward compatibility during migration.
-    """
-    try:
-        result = process_approval(payload, reg)
-    except Exception as exc:
-        LOGGER.exception(
-            "Unexpected error processing entry approval. "
-            "evaluation_series_id=%s",
-            payload.evaluation_series_id,
-        )
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-    return JSONResponse(content=result)
 
 
 @app.get("/health", summary="Liveness check")
