@@ -304,6 +304,7 @@ async def _run_ingestion_pipeline(
         idle_warning_seconds=args.idle_warning_seconds,
         session_source_mode=session_source_mode or args.session_source_mode,
         metrics_log_interval=args.metrics_log_interval,
+        memory_sample_interval=getattr(args, "memory_sample_interval", 0.0),
         log_level=args.log_level,
         # Inject the shared registry so the pipeline and API server see the
         # same sessions. None here tells the pipeline to create its own.
@@ -397,6 +398,21 @@ async def _run_publisher_schedule(
         use_approval_api,
     )
     await asyncio.gather(*lifecycle_tasks)
+
+    # ── Publisher totals ─────────────────────────────────────────────────────
+    # After all drone lifecycles finish, each publisher's ``published_count``
+    # is the number of in-mission telemetry messages it sent (not counting the
+    # final ``mission_completed`` message emitted during stop()).  Add one per
+    # drone so the stress-test driver can compare total-sent against the
+    # pipeline's ``enqueued`` count to estimate broker-side drops.
+    per_drone_sent = [publisher.published_count + 1 for publisher in publishers]
+    total_published = sum(per_drone_sent)
+    LOGGER.info(
+        "Publisher totals: published=%s drones=%s avg_per_drone=%.1f",
+        total_published,
+        len(publishers),
+        (total_published / len(publishers)) if publishers else 0.0,
+    )
 
 
 # ── Main test coordinator ─────────────────────────────────────────────────────
@@ -593,6 +609,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=15.0,
         help="Seconds between queue-depth and latency metric log lines",
+    )
+    parser.add_argument(
+        "--memory-sample-interval",
+        type=float,
+        default=0.0,
+        help=(
+            "Seconds between RSS memory samples inside the pipeline process. "
+            "0 disables sampling. The final shutdown metrics line adds peak/avg/current RSS when enabled."
+        ),
     )
     parser.add_argument(
         "--ingestion-start-delay",

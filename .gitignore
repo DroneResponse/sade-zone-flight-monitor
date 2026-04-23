@@ -16,6 +16,23 @@ mission_rows.csv
 *.log
 .pytest_cache/
 
+# PKI material — never commit certificates, private keys, or signing requests.
+# Certs for AWS IoT Core (and anything similar) should live outside the repo
+# and be mounted into the container at runtime.
+*.key
+*.crt
+*.csr
+*.pem
+*.pfx
+*.p12
+
+# Deployment env files — `.env.example` IS committed (it's a template with
+# placeholder values), but any real `.env` file with filled-in secrets must
+# never be committed.
+.env
+.env.local
+.env.*.local
+
 # Claude Code project config
 .claude/
 

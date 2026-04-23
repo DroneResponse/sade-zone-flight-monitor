@@ -224,6 +224,17 @@ class SimulatedDronePublisher:
         self._message_index = 0
         self._battery_voltage = random.uniform(16.1, 16.8)
 
+    @property
+    def published_count(self) -> int:
+        """How many telemetry messages this publisher has sent so far.
+
+        Does not include the final ``mission_completed`` message sent during
+        ``stop()`` — callers that want the full fleet-wide send count should
+        either sample this after ``stop()`` and add 1, or just treat this as
+        the in-mission publish count (the stress-test driver does the latter).
+        """
+        return self._message_index
+
     def start(self) -> None:
         """Connect to MQTT and begin publishing telemetry on a daemon thread."""
         self.mqtt_client.connect()

@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -27,15 +28,34 @@ from app.monitoring.state_tracker import DroneState
 
 LOGGER = logging.getLogger(__name__)
 
-# Authoritative URL from the SADE API reference.
-# Defined here explicitly so the value stays visible and auditable.
-# TODO: This should be made configurable via an environment variable
-# (e.g. TRACKER_FINALIZED_URL) so deployments against different SADE
-# environments don't require a code change.
-TRACKER_FINALIZED_URL = (
-    "http://sarec-sade-use2-api-alb-1413405053.us-east-2.elb.amazonaws.com"
-    "/tracker-session-finalized"
-)
+# Target URL for the SADE /tracker-session-finalized callback.
+#
+# Deployments must provide this via the TRACKER_FINALIZED_URL environment
+# variable so the same image can be promoted across environments (dev /
+# staging / prod / new regions) without a code change.  No default is
+# supplied on purpose: silently POSTing to the wrong backend is worse than
+# refusing to start.  ``get_tracker_finalized_url()`` raises a clear error
+# at the point of use if the variable is unset.
+TRACKER_FINALIZED_URL_ENV_VAR = "TRACKER_FINALIZED_URL"
+
+
+def get_tracker_finalized_url() -> str:
+    """Return the configured SADE finalization URL, or raise if unset.
+
+    Read at call time (not import time) so that tests and local runs that
+    never hit the POST path can import this module without being forced to
+    set the env var.  The pipeline's startup path also calls this eagerly
+    when ``finalize_to_api`` is enabled so misconfiguration fails fast.
+    """
+    url = os.getenv(TRACKER_FINALIZED_URL_ENV_VAR)
+    if not url:
+        raise RuntimeError(
+            f"{TRACKER_FINALIZED_URL_ENV_VAR} is not set. "
+            "This environment variable is required to POST finalization reports "
+            "to SADE.  Set it to the full /tracker-session-finalized URL for the "
+            "target environment."
+        )
+    return url
 
 
 def build_finalization_payload(state: DroneState) -> dict[str, Any]:
@@ -128,6 +148,7 @@ async def post_tracker_session_finalized(payload: dict[str, Any]) -> dict[str, A
     attempts are exhausted.
     """
     flight_session_id = payload.get("flight_session_id")
+    tracker_url = get_tracker_finalized_url()
 
     LOGGER.info(
         "Sending tracker finalization POST for flight_session_id=%s actual_start=%s actual_end=%s",
@@ -140,11 +161,11 @@ async def post_tracker_session_finalized(payload: dict[str, Any]) -> dict[str, A
 
     for attempt in range(1 + MAX_RETRIES):
         try:
-            result = await _attempt_post(payload)
+            result = await _attempt_post(payload, tracker_url)
 
             LOGGER.info(
                 "POST %s → HTTP 200 | flight_session_id=%s | body=%s (attempt %d/%d)",
-                TRACKER_FINALIZED_URL,
+                tracker_url,
                 flight_session_id,
                 json.dumps(result),
                 attempt + 1,
@@ -157,7 +178,7 @@ async def post_tracker_session_finalized(payload: dict[str, Any]) -> dict[str, A
             body = exc.read().decode(errors="replace")
             LOGGER.error(
                 "POST %s → HTTP %s | flight_session_id=%s | body=%s (attempt %d/%d)",
-                TRACKER_FINALIZED_URL,
+                tracker_url,
                 exc.code,
                 flight_session_id,
                 body,
@@ -175,7 +196,7 @@ async def post_tracker_session_finalized(payload: dict[str, Any]) -> dict[str, A
         except Exception as exc:
             LOGGER.error(
                 "POST %s failed for flight_session_id=%s: %s (attempt %d/%d)",
-                TRACKER_FINALIZED_URL,
+                tracker_url,
                 flight_session_id,
                 exc,
                 attempt + 1,
@@ -202,7 +223,7 @@ async def post_tracker_session_finalized(payload: dict[str, Any]) -> dict[str, A
     return None
 
 
-async def _attempt_post(payload: dict[str, Any]) -> dict[str, Any]:
+async def _attempt_post(payload: dict[str, Any], url: str) -> dict[str, Any]:
     """Execute one blocking HTTP POST in a thread and return the parsed body.
 
     Raises ``urllib.error.HTTPError`` on non-2xx responses and any other
@@ -210,7 +231,7 @@ async def _attempt_post(payload: dict[str, Any]) -> dict[str, Any]:
     """
     data = json.dumps(payload).encode()
     request = urllib.request.Request(
-        TRACKER_FINALIZED_URL,
+        url,
         data=data,
         headers={"Content-Type": "application/json"},
         method="POST",

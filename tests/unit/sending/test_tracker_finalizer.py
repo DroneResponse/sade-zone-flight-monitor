@@ -9,10 +9,12 @@ import pytest
 
 from app.monitoring.state_tracker import DroneState
 from app.sending.tracker_finalizer import (
+    TRACKER_FINALIZED_URL_ENV_VAR,
     _log_finalization_response,
     _to_utc_z,
     build_finalization_payload,
     build_stub_finalization_payload,
+    get_tracker_finalized_url,
 )
 
 
@@ -47,6 +49,25 @@ def _make_drone_state(
 
 def _utc_now_z() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ── get_tracker_finalized_url() ──────────────────────────────────────────────
+
+
+class TestGetTrackerFinalizedUrl:
+    def test_returns_env_var_when_set(self, monkeypatch):
+        monkeypatch.setenv(TRACKER_FINALIZED_URL_ENV_VAR, "http://mock.example.com/tracker-session-finalized")
+        assert get_tracker_finalized_url() == "http://mock.example.com/tracker-session-finalized"
+
+    def test_raises_when_unset(self, monkeypatch):
+        monkeypatch.delenv(TRACKER_FINALIZED_URL_ENV_VAR, raising=False)
+        with pytest.raises(RuntimeError, match=TRACKER_FINALIZED_URL_ENV_VAR):
+            get_tracker_finalized_url()
+
+    def test_raises_when_empty(self, monkeypatch):
+        monkeypatch.setenv(TRACKER_FINALIZED_URL_ENV_VAR, "")
+        with pytest.raises(RuntimeError, match=TRACKER_FINALIZED_URL_ENV_VAR):
+            get_tracker_finalized_url()
 
 
 # ── build_finalization_payload() ─────────────────────────────────────────────

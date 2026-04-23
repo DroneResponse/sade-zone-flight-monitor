@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import ssl
 import time
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -58,6 +59,17 @@ class TelemetryMqttIngestionClient:
         username: Optional[str] = None,
         password: Optional[str] = None,
         tls_enabled: bool = False,
+        # mTLS — required for AWS IoT Core.  All three paths must be set
+        # together, or all three must be left unset.  See ``_build_client``
+        # for the mode-selection rules.
+        ca_cert_path: Optional[str] = None,
+        client_cert_path: Optional[str] = None,
+        private_key_path: Optional[str] = None,
+        # MQTT client ID — AWS IoT Core policies typically restrict which
+        # client IDs a given cert can use, so this MUST be set for IoT Core
+        # deployments.  When None, paho generates a random client ID (fine
+        # for local / unauthenticated brokers).
+        client_id: Optional[str] = None,
     ) -> None:
         """Initialize ingestion client configuration.
 
@@ -72,7 +84,26 @@ class TelemetryMqttIngestionClient:
             username: Optional MQTT username for broker authentication.
             password: Optional MQTT password (used only when username is set).
             tls_enabled: When True, enables TLS on the connection. Required for
-                most cloud brokers. Uses the system CA bundle by default.
+                most cloud brokers.
+            ca_cert_path: Path to the server-authentication CA certificate.
+                Required for mTLS (AWS IoT Core).
+            client_cert_path: Path to this client's signed X.509 certificate.
+                Required for mTLS (AWS IoT Core).
+            private_key_path: Path to this client's private key (matches
+                ``client_cert_path``).  Required for mTLS (AWS IoT Core).
+
+        TLS / mTLS mode selection (evaluated in ``_build_client``):
+            * ``tls_enabled=False`` → plain TCP.  All three cert paths are
+              ignored.  Intended for localhost / development.
+            * ``tls_enabled=True`` and all three cert paths set → mTLS.
+              paho is configured with ``ca_certs`` + ``certfile`` + ``keyfile``
+              using TLSv1.2.  This is the AWS IoT Core path.
+            * ``tls_enabled=True`` and none of the three cert paths set →
+              generic TLS using the system CA bundle.  Supports managed
+              brokers that use username/password over TLS (e.g. HiveMQ Cloud).
+            * ``tls_enabled=True`` with one or two of the three paths set →
+              raise ``RuntimeError``.  A partial mTLS config is almost
+              always a misconfiguration rather than intent.
         """
         self.queue = queue
         self.loop = loop
@@ -84,6 +115,10 @@ class TelemetryMqttIngestionClient:
         self.username = username
         self.password = password
         self.tls_enabled = tls_enabled
+        self.ca_cert_path = ca_cert_path
+        self.client_cert_path = client_cert_path
+        self.private_key_path = private_key_path
+        self.client_id = client_id
 
         self._client: Optional[mqtt.Client] = None
         self._last_message_monotonic: float | None = None
@@ -132,16 +167,18 @@ class TelemetryMqttIngestionClient:
         Uses callback API v2 when available, while staying compatible with older
         Paho versions.
         """
+        # Pass client_id only when explicitly configured.  None lets paho
+        # generate a random ID (fine for local / unauthenticated brokers) but
+        # AWS IoT Core policies typically restrict which client IDs a given
+        # cert is allowed to use, so real deployments must set this.
+        client_id_kwarg = {"client_id": self.client_id} if self.client_id else {}
         try:
-            client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+            client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, **client_id_kwarg)
         except Exception:  # noqa: BLE001
-            client = mqtt.Client()
+            client = mqtt.Client(**client_id_kwarg)
 
-        # Enable TLS before setting credentials — order matters for Paho.
-        # tls_set() with no args uses the system CA bundle, which works for
-        # AWS IoT Core, HiveMQ Cloud, and most managed MQTT brokers.
-        if self.tls_enabled:
-            client.tls_set()
+        # Configure TLS / mTLS before setting credentials — order matters for Paho.
+        self._configure_tls(client)
 
         # Set credentials if provided. Leave unset for unauthenticated brokers.
         if self.username:
@@ -151,6 +188,62 @@ class TelemetryMqttIngestionClient:
         client.on_connect = self._on_connect
         client.on_message = self._on_message
         return client
+
+    def _configure_tls(self, client: mqtt.Client) -> None:
+        """Apply the correct TLS / mTLS mode to the paho client.
+
+        Decides between three modes based on the instance's TLS attributes:
+
+        1. Plain TCP — ``tls_enabled`` is False.  No ``tls_set()`` call.
+        2. mTLS — ``tls_enabled`` is True and all three cert paths are set.
+           ``tls_set()`` is called with explicit ``ca_certs`` + ``certfile``
+           + ``keyfile`` paths.  This is the AWS IoT Core mode.
+        3. Generic TLS — ``tls_enabled`` is True and no cert paths are set.
+           ``tls_set()`` is called with no args so paho uses the system
+           trust store.  Useful for username/password-over-TLS brokers.
+
+        Raises:
+            RuntimeError: ``tls_enabled`` is True and one or two of the three
+                cert paths are set (a partial configuration).  Almost always a
+                misconfiguration rather than intent, so we fail fast at
+                pipeline startup rather than silently skipping client auth.
+        """
+        if not self.tls_enabled:
+            LOGGER.info("MQTT transport: plain TCP (tls_enabled=False)")
+            return
+
+        cert_paths = (self.ca_cert_path, self.client_cert_path, self.private_key_path)
+        set_count = sum(1 for path in cert_paths if path)
+
+        if set_count == 3:
+            client.tls_set(
+                ca_certs=self.ca_cert_path,
+                certfile=self.client_cert_path,
+                keyfile=self.private_key_path,
+                tls_version=ssl.PROTOCOL_TLSv1_2,
+            )
+            LOGGER.info(
+                "MQTT transport: mTLS (ca=%s cert=%s key=%s)",
+                self.ca_cert_path,
+                self.client_cert_path,
+                self.private_key_path,
+            )
+            return
+
+        if set_count == 0:
+            client.tls_set()
+            LOGGER.info("MQTT transport: generic TLS (system CA bundle)")
+            return
+
+        raise RuntimeError(
+            "MQTT mTLS configuration is incomplete. "
+            "Set all three of MQTT_CA_CERT_PATH, MQTT_CLIENT_CERT_PATH, and "
+            "MQTT_PRIVATE_KEY_PATH for AWS IoT Core, or leave all three unset "
+            "for generic TLS using the system CA bundle. "
+            f"Currently set: ca_cert_path={bool(self.ca_cert_path)}, "
+            f"client_cert_path={bool(self.client_cert_path)}, "
+            f"private_key_path={bool(self.private_key_path)}."
+        )
 
     def _on_connect(
         self,
@@ -234,19 +327,19 @@ def start_mqtt_client(
     topic: str = "update_drone",
     keepalive: int = 30,
     metrics: Optional[PipelineMetrics] = None,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+    tls_enabled: bool = False,
+    ca_cert_path: Optional[str] = None,
+    client_cert_path: Optional[str] = None,
+    private_key_path: Optional[str] = None,
+    client_id: Optional[str] = None,
 ) -> TelemetryMqttIngestionClient:
     """Convenience helper to create and start the ingestion MQTT client.
 
-    Args:
-        queue: Shared asyncio queue receiving MQTT message envelopes.
-        loop: Event loop that owns the queue.
-        broker: MQTT broker host.
-        port: MQTT broker port.
-        topic: Telemetry topic filter.
-        keepalive: MQTT keepalive interval in seconds.
-
-    Returns:
-        Started ``TelemetryMqttIngestionClient`` instance.
+    Accepts the same auth / TLS / mTLS kwargs as
+    ``TelemetryMqttIngestionClient.__init__`` and forwards them verbatim.
+    See that class's docstring for mode-selection rules.
     """
     client = TelemetryMqttIngestionClient(
         queue,
@@ -256,6 +349,13 @@ def start_mqtt_client(
         topic=topic,
         keepalive=keepalive,
         metrics=metrics,
+        username=username,
+        password=password,
+        tls_enabled=tls_enabled,
+        ca_cert_path=ca_cert_path,
+        client_cert_path=client_cert_path,
+        private_key_path=private_key_path,
+        client_id=client_id,
     )
     client.start()
     return client

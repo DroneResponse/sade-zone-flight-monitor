@@ -42,6 +42,39 @@ ENV SESSION_SOURCE_MODE=aws \
     METRICS_LOG_INTERVAL=30 \
     LOG_LEVEL=INFO
 
+# TRACKER_FINALIZED_URL is REQUIRED when FINALIZE_TO_API=true and is
+# intentionally NOT given a default here.  Every deployment must pass its
+# target SADE /tracker-session-finalized URL explicitly (via `docker run -e`,
+# ECS task definition env, etc.) so the same image can be promoted across
+# environments without a code change and so misconfiguration fails fast at
+# pipeline startup rather than silently POSTing to the wrong backend.
+
+# ── mTLS paths (AWS IoT Core) ────────────────────────────────────────────────
+# These are *paths*, not contents.  The actual certificate + key files must be
+# supplied at runtime via a bind mount:
+#     docker run -v /host/sade-certs:/certs:ro ...
+# or via ECS task definition secrets / AWS Secrets Manager.  NEVER `COPY` a
+# private key (*.key) into this image — it would end up cached in the image
+# layer history forever and be recoverable by anyone who has the image.
+#
+# All three paths must be set together for mTLS to engage.  Leaving them
+# unset while MQTT_TLS_ENABLED=true uses generic TLS with the system CA
+# bundle instead (for username/password-over-TLS brokers like HiveMQ Cloud).
+ENV MQTT_CA_CERT_PATH=/certs/CAs.crt \
+    MQTT_CLIENT_CERT_PATH=/certs/client.crt \
+    MQTT_PRIVATE_KEY_PATH=/certs/client.key
+
+# ── MQTT client identifier (AWS IoT Core) ────────────────────────────────────
+# MQTT_CLIENT_ID is required when running against AWS IoT Core: the IoT policy
+# attached to your client certificate typically restricts which client IDs the
+# cert may use, so paho's random default will be silently rejected during the
+# MQTT CONNECT phase (the connection appears to hang with no error logged).
+#
+# Intentionally NOT given a default here — each deployment must declare its
+# own stable, policy-allowed identifier (e.g. `tlohman-flight-monitor`).  Only
+# one MQTT connection may use a given ID at a time; a second connection with
+# the same ID will cause IoT Core to disconnect the first.
+
 # CSV output — disabled by default in the container (no persistent volume
 # mounted). Set MISSION_ROWS_OUT to a path inside a mounted volume to enable.
 ENV MISSION_ROWS_OUT=""

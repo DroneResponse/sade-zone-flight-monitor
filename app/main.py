@@ -26,9 +26,11 @@ from app.monitoring.active_session_registry import ActiveSessionRegistry
 from app.monitoring.mission_row_builder import MissionRowBuilder
 from app.common.mission_row_writer import MissionCsvWriter
 from app.ingestion.mqtt_client import TelemetryMqttIngestionClient
+from app.monitoring.memory_sampler import MemorySampler, memory_sampler_loop
 from app.monitoring.pipeline_metrics import PipelineMetrics
 from app.monitoring.state_tracker import DroneStateTracker
 from app.ingestion.workers import telemetry_worker
+from app.sending.tracker_finalizer import get_tracker_finalized_url
 
 LOGGER = logging.getLogger(__name__)
 
@@ -124,6 +126,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Seconds between queue-depth and latency metric log lines",
     )
     parser.add_argument(
+        "--memory-sample-interval",
+        type=float,
+        default=float(os.getenv("MEMORY_SAMPLE_INTERVAL", "0")),
+        help=(
+            "Seconds between RSS memory samples. "
+            "0 disables memory sampling. "
+            "The final shutdown metrics line includes peak/average/current RSS when enabled."
+        ),
+    )
+    parser.add_argument(
         "--finalize-to-api",
         action="store_true",
         default=os.getenv("FINALIZE_TO_API", "").lower() in {"1", "true", "yes"},
@@ -159,6 +171,46 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=os.getenv("MQTT_TLS_ENABLED", "").lower() in {"1", "true", "yes"},
         help="Enable TLS on the MQTT connection (MQTT_TLS_ENABLED env var)",
+    )
+
+    # ── mTLS (AWS IoT Core) ──────────────────────────────────────────────────
+    # All three paths must be set together.  Leave unset when not using mTLS.
+    # See TelemetryMqttIngestionClient for the full mode-selection rules.
+    parser.add_argument(
+        "--mqtt-ca-cert",
+        default=os.getenv("MQTT_CA_CERT_PATH", ""),
+        help=(
+            "Path to the CA certificate used to verify the MQTT broker "
+            "(MQTT_CA_CERT_PATH env var). Required for AWS IoT Core mTLS."
+        ),
+    )
+    parser.add_argument(
+        "--mqtt-client-cert",
+        default=os.getenv("MQTT_CLIENT_CERT_PATH", ""),
+        help=(
+            "Path to this client's signed X.509 certificate "
+            "(MQTT_CLIENT_CERT_PATH env var). Required for AWS IoT Core mTLS."
+        ),
+    )
+    parser.add_argument(
+        "--mqtt-private-key",
+        default=os.getenv("MQTT_PRIVATE_KEY_PATH", ""),
+        help=(
+            "Path to this client's private key matching the client certificate "
+            "(MQTT_PRIVATE_KEY_PATH env var). Required for AWS IoT Core mTLS. "
+            "Must be a bind-mounted path — never bake key material into the image."
+        ),
+    )
+    parser.add_argument(
+        "--mqtt-client-id",
+        default=os.getenv("MQTT_CLIENT_ID", ""),
+        help=(
+            "MQTT client identifier (MQTT_CLIENT_ID env var). "
+            "Required for AWS IoT Core: the IoT policy attached to your "
+            "certificate typically restricts which client IDs the cert may "
+            "use, so paho's random default will be silently rejected. "
+            "Leave unset for local / unauthenticated brokers."
+        ),
     )
 
     # ── FastAPI server (used by run_service / container mode) ────────────────
@@ -211,11 +263,20 @@ async def idle_message_watchdog(
 
 async def run_pipeline(args: argparse.Namespace) -> None:
     """Create and run the telemetry pipeline until interrupted."""
+    # Fail-fast on misconfigured finalization: if the pipeline is going to POST
+    # to SADE, we refuse to start without a configured TRACKER_FINALIZED_URL.
+    # Silently POSTing to the wrong backend is worse than refusing to start.
+    finalize_to_api = getattr(args, "finalize_to_api", False)
+    resolved_tracker_url: str | None = None
+    if finalize_to_api:
+        resolved_tracker_url = get_tracker_finalized_url()
+
     queue: asyncio.Queue[dict[str, object]] = asyncio.Queue(maxsize=args.queue_size)
     state_tracker = getattr(args, "state_tracker", None) or DroneStateTracker()
     row_writer = MissionCsvWriter(out_path=args.out)
     row_builder = MissionRowBuilder()
     metrics = PipelineMetrics()
+    memory_sampler = MemorySampler()
 
     # Future AWS integration can inject a pre-populated registry onto args.
     session_registry = getattr(args, "session_registry", None) or ActiveSessionRegistry()
@@ -230,6 +291,13 @@ async def run_pipeline(args: argparse.Namespace) -> None:
         username=getattr(args, "mqtt_username", "") or None,
         password=getattr(args, "mqtt_password", "") or None,
         tls_enabled=getattr(args, "mqtt_tls", False),
+        # mTLS — all three paths must be set together for AWS IoT Core.
+        # Empty strings (local / non-mTLS deployments) are normalised to None
+        # so the client's mode selection sees "unset" rather than a bogus path.
+        ca_cert_path=getattr(args, "mqtt_ca_cert", "") or None,
+        client_cert_path=getattr(args, "mqtt_client_cert", "") or None,
+        private_key_path=getattr(args, "mqtt_private_key", "") or None,
+        client_id=getattr(args, "mqtt_client_id", "") or None,
     )
     mqtt_client.start()
 
@@ -266,8 +334,13 @@ async def run_pipeline(args: argparse.Namespace) -> None:
         )
     )
 
+    memory_sample_interval = float(getattr(args, "memory_sample_interval", 0.0) or 0.0)
+    memory_task = asyncio.create_task(
+        memory_sampler_loop(memory_sampler, interval_seconds=memory_sample_interval)
+    )
+
     LOGGER.info(
-        "Pipeline started: broker=%s port=%s topic=%s workers=%s out=%s session_source_mode=%s idle_warning=%ss metrics_log_interval=%ss",
+        "Pipeline started: broker=%s port=%s topic=%s workers=%s out=%s session_source_mode=%s idle_warning=%ss metrics_log_interval=%ss finalize_to_api=%s tracker_url=%s",
         args.broker,
         args.port,
         args.topic,
@@ -276,6 +349,8 @@ async def run_pipeline(args: argparse.Namespace) -> None:
         args.session_source_mode,
         max(1.0, args.idle_warning_seconds),
         max(1.0, args.metrics_log_interval),
+        finalize_to_api,
+        resolved_tracker_url or "(not configured — finalization disabled)",
     )
 
     try:
@@ -288,7 +363,8 @@ async def run_pipeline(args: argparse.Namespace) -> None:
 
         metrics_task.cancel()
         watchdog_task.cancel()
-        await asyncio.gather(metrics_task, watchdog_task, return_exceptions=True)
+        memory_task.cancel()
+        await asyncio.gather(metrics_task, watchdog_task, memory_task, return_exceptions=True)
 
         mqtt_client.stop()
 
@@ -304,8 +380,9 @@ async def run_pipeline(args: argparse.Namespace) -> None:
         await asyncio.gather(*worker_tasks, return_exceptions=True)
 
         snapshot = metrics.snapshot(queue.qsize())
+        memory_snapshot = memory_sampler.snapshot()
         LOGGER.info(
-            "Shutdown metrics: queue_current=%s queue_max=%s enqueued=%s processed=%s failed=%s dropped=%s final_rows=%s queue_latency_avg_ms=%.2f queue_latency_max_ms=%.2f processing_avg_ms=%.2f processing_max_ms=%.2f",
+            "Shutdown metrics: queue_current=%s queue_max=%s enqueued=%s processed=%s failed=%s dropped=%s final_rows=%s queue_latency_avg_ms=%.2f queue_latency_max_ms=%.2f processing_avg_ms=%.2f processing_max_ms=%.2f memory_samples=%s rss_current_mb=%.2f rss_peak_mb=%.2f rss_avg_mb=%.2f",
             snapshot.current_queue_depth,
             snapshot.max_queue_depth,
             snapshot.enqueued_messages,
@@ -317,6 +394,10 @@ async def run_pipeline(args: argparse.Namespace) -> None:
             snapshot.max_queue_latency_ms,
             snapshot.average_processing_ms,
             snapshot.max_processing_ms,
+            memory_snapshot.sample_count,
+            memory_snapshot.rss_current_mb,
+            memory_snapshot.rss_peak_mb,
+            memory_snapshot.rss_average_mb,
         )
         LOGGER.info(
             "Shutdown complete. Active unfinished mission states=%s active sessions=%s",

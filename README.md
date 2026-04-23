@@ -4,7 +4,7 @@ This service is the **flight monitor / telemetry tracker** component of the SADE
 
 - It receives live telemetry from active drones over MQTT
 - It tracks mission state per drone in memory (altitude, battery, position, message count)
-- When a mission completes, it sends a finalization report to the SADE AWS API (`POST /tracker-session-finalized`), which closes the approved session and records the reputation entry
+- When a mission completes (either via terminal MQTT status or via an exit request from SADE), it sends a finalization report to the SADE AWS API (`POST /tracker-session-finalized`), which closes the approved session and records the reputation entry
 
 The service does **not** make entry decisions. That is SADE's job. This service only watches flights that SADE has already approved, records what actually happened, and reports back when they land.
 
@@ -15,12 +15,13 @@ The service does **not** make entry decisions. That is SADE's job. This service 
 ```
 SADE AWS API
     │
-    │  POST /entry-approval
+    │  POST /flight-monitor/register-session      (normal registration)
+    │  POST /flight-monitor/exit-request          (drone left zone early)
     ▼
-FastAPI Webhook Server              ← receives approval events from SADE
+FastAPI Webhook Server              ← receives session lifecycle events from SADE
 (app/api/server.py)
     │
-    │  registers flight_session_id
+    │  registers flight_session_id (and/or starts exit grace period)
     ▼
 ActiveSessionRegistry               ← in-memory store of approved sessions
 (app/monitoring/active_session_registry.py)
@@ -36,12 +37,14 @@ Telemetry Worker(s)                 ← one or more async worker tasks
     ├── lookup session in registry (drop message if not registered)
     ├── update DroneStateTracker (altitude min/max, voltage, position, count)
     │
-    └── on terminal status (mission_completed / complete / done / ...):
+    └── on terminal status (mission_completed / complete / done / ...)
+        OR exit-request grace period elapses:
             │
             ├── write CSV row (if --out is set)
             │
             └── POST /tracker-session-finalized  (if --finalize-to-api)
-                    │
+                    │  (with up to 2 retries on 5xx / network errors,
+                    │   exponential backoff [1s, 2s])
                     ▼
                 SADE AWS API  →  closes session, writes reputation record
 ```
@@ -64,15 +67,55 @@ Finalization fires exactly once per session when a terminal status arrives. The 
 
 ### `aws` mode (production)
 
-Drones are only tracked if they have a pre-registered approved session in the `ActiveSessionRegistry`. Sessions enter the registry via the `POST /entry-approval` webhook, which SADE posts to this service after approving a flight.
+Drones are only tracked if they have a pre-registered approved session in the `ActiveSessionRegistry`. Sessions enter the registry via the `POST /flight-monitor/register-session` webhook (per `SADE_AWS_API_INFORMATION/FLIGHT_MONITOR_CONTRACT.md`), which SADE posts to this service after approving a flight.
 
 If a telemetry message arrives for a drone with no registered session, it is silently dropped.
+
+When running under `run_service()` (the production / container startup path), the mode is forced to `aws` regardless of the CLI/env value.
 
 ### `local` mode (testing shortcut)
 
 The pipeline auto-creates a synthetic session for any drone that publishes a message, without requiring any approval webhook. Useful for quick telemetry tests when you don't want to stand up the full approval flow.
 
 Set via `--session-source-mode local` or `SESSION_SOURCE_MODE=local`.
+
+---
+
+## API endpoints
+
+All endpoints are served by the FastAPI app in `app/api/server.py` on port `8000` (configurable via `API_PORT`).
+
+### `POST /flight-monitor/register-session`  — primary registration endpoint
+
+Contract-aligned endpoint matching `SADE_AWS_API_INFORMATION/FLIGHT_MONITOR_CONTRACT.md`. Registration implicitly means the session has been approved by SADE. Once registered, MQTT telemetry published by the drone will be accepted and tracked.
+
+- `202 Accepted` — session registered, telemetry tracking active
+- `409 Conflict` — the drone already has an active session, registration rejected
+
+**Test overrides / stub finalization.** If the registration payload includes a non-null `test_overrides` object, the real MQTT telemetry path is bypassed. A background task waits `STUB_FINALIZATION_DELAY_SECONDS` (5s), builds a finalization payload from the overrides (filling missing fields with safe defaults), POSTs it to `/tracker-session-finalized`, and marks the session complete. This lets SADE exercise the full register → finalize roundtrip without a real drone.
+
+### `POST /flight-monitor/exit-request`  — early-exit handling
+
+Notifies the Flight Monitor that a drone has left the zone early (or the session otherwise needs to close out). Documented in full in `SADE_AWS_API_INFORMATION/EXIT_REQUEST_GUIDE.md`.
+
+- `202 Accepted` — session found, grace period started
+- `404 Not Found` — no active session for `flight_session_id` (already finalized or never registered); safe to retry
+
+**Grace period behaviour:**
+- Session stays active — MQTT telemetry continues to be accepted and tracked during the grace period.
+- A background task checks every `EXIT_GRACE_CHECK_INTERVAL_SECONDS` (30s) whether new telemetry has arrived.
+- If the drone keeps transmitting, a warning is logged each cycle and the silence timer resets.
+- After `EXIT_GRACE_PERIOD_SECONDS` (300s / 5 min) of continuous silence, the accumulated state is finalized and POSTed to SADE.
+- If the drone sends a terminal MQTT status during the grace period, the normal worker path finalizes and the grace task exits cleanly.
+- If no telemetry was ever received, a finalization with an empty telemetry summary is still sent so SADE can close the session.
+
+### `POST /entry-approval`  — deprecated
+
+Original entry-approval webhook, kept for backward compatibility during migration. Logs a deprecation warning on every call. Will be removed once all callers are on the contract endpoint.
+
+### `GET /health`
+
+Returns `{"status": "ok", "active_sessions": <count>}`.
 
 ---
 
@@ -86,36 +129,51 @@ pip install -r requirements.txt
 # Install: sudo apt install mosquitto  or  brew install mosquitto
 ```
 
-### Start the pipeline manually
+### Run via env file (recommended)
+
+The quickest way to launch the service — particularly against AWS IoT Core — is to copy the committed `.env.example` template, fill in your deployment values, and run `scripts/run_flight_monitor.sh`. The wrapper validates the config before launching (checks cert files exist, `MQTT_CLIENT_ID` is set when mTLS is on, `TRACKER_FINALIZED_URL` is set when finalization is on, etc.) and prints a one-screen summary so misconfiguration surfaces immediately instead of as a silent MQTT hang.
 
 ```bash
-# aws mode: drones must enter through the approval API first
-python run.py --session-source-mode aws --finalize-to-api
-
-# local mode: no approval step, sessions created automatically
-python run.py --session-source-mode local --out mission_rows.csv
+cp .env.example .env
+$EDITOR .env                          # fill in broker, client ID, cert paths, SADE URL, ...
+scripts/run_flight_monitor.sh         # uses ./.env by default
+scripts/run_flight_monitor.sh .env.aws-staging   # or a non-default env file
 ```
 
-### Run the automated local test (recommended)
+`.env` is gitignored (`.env.example` is not) so your real values stay local.
 
-The `scripts/run_local_test.py` script starts everything — Mosquitto, the FastAPI approval server, the ingestion pipeline, and simulated drones — wired together and self-contained.
+### Start the service manually
+
+If you'd rather not use the env-file wrapper, `run.py` reads the same env vars directly:
 
 ```bash
-# 3 drones, 60 seconds each, entering through the approval API, reporting to AWS
-python scripts/run_local_test.py \
-  --drone-count 3 \
-  --publisher-runtime-seconds 60 \
-  --finalize-to-api
-
-# Quick smoke test — local session mode, no AWS call
-python scripts/run_local_test.py \
-  --drone-count 2 \
-  --publisher-runtime-seconds 30 \
-  --skip-approval-api \
-  --session-source-mode local
+# Full service (FastAPI + MQTT pipeline). Forces aws session mode.
+python run.py --finalize-to-api
 ```
 
-Output CSVs and logs land in `local_test_output/`.
+The pipeline alone (no webhook server) is not directly exposed on the CLI — `run.py` always runs the combined service path (`app.main.run_service`). If you want the pipeline standalone for local testing, either:
+
+- use `local` session mode so telemetry auto-creates sessions (no webhook needed), or
+- run the FastAPI app alone with uvicorn (`uvicorn app.api.server:app --host 0.0.0.0 --port 8000`).
+
+```bash
+# Local mode smoke test — no approval step, sessions created automatically
+SESSION_SOURCE_MODE=local python run.py --out mission_rows.csv
+```
+
+### Running tests
+
+```bash
+# Unit tests (fast, no external services required)
+python -m pytest tests/unit
+
+# Integration tests (each script boots its own in-process services)
+python tests/integration/test_mqtt_telemetry_pipeline.py
+python tests/integration/test_stub_finalization_override.py
+python tests/integration/test_exit_request_grace_period.py
+```
+
+The unit suite covers the approval handler, exit handler, MQTT workers, active session registry, mission row builder, pipeline metrics, state tracker, and tracker finalizer. The integration scripts each exercise one end-to-end slice: MQTT telemetry → finalization, `test_overrides` stub path, and exit-request grace period.
 
 ### Key CLI flags
 
@@ -156,21 +214,33 @@ docker run --rm -p 8000:8000 \
   sade-telemetry-monitor:latest
 ```
 
+`FINALIZE_TO_API=false` is what lets this local-run command start without a `TRACKER_FINALIZED_URL` — the pipeline only enforces the env var when it's actually going to POST to SADE.
+
 `/health` is available at `http://localhost:8000/health` once the container starts.
 
 ### Run in production / AWS
 
+> **Breaking change (2026-04-22):** `TRACKER_FINALIZED_URL` is now a required env var whenever `FINALIZE_TO_API=true` (the container default). The previous release's hardcoded AWS ALB URL has been removed, and the container will **fail to start** if this variable is unset while finalization is enabled. Set it explicitly for every environment you deploy to (see the example below).
+
+**Before running the command below**, place your PKI files in `~/sade-certs/` on the host (or wherever you prefer — adjust the `-v` mount accordingly). The directory must contain `CAs.crt`, `client.crt`, and `client.key`, or override the paths via `MQTT_CA_CERT_PATH`, `MQTT_CLIENT_CERT_PATH`, and `MQTT_PRIVATE_KEY_PATH`. See `SADE_AWS_API_INFORMATION/aws_iot_pki.md` for how to generate the cert/key pair. AWS IoT Core will reject the connection without a valid client cert — username/password alone will not work.
+
+> **Heads up on `MQTT_CLIENT_ID`:** this is required for AWS IoT Core. The IoT policy attached to your cert restricts which client IDs are allowed, so paho's random default will be silently rejected and the MQTT CONNECT phase will hang with no error logged. Set it explicitly (see the example below) and make sure only one instance at a time uses a given ID.
+
 ```bash
 docker run -d --restart unless-stopped \
   -p 8000:8000 \
-  -e MQTT_BROKER_HOST=your-broker.example.com \
+  -v ~/sade-certs:/certs:ro \
+  -e MQTT_BROKER_HOST=a3dpdfmwa109lg-ats.iot.us-east-2.amazonaws.com \
   -e MQTT_BROKER_PORT=8883 \
   -e MQTT_TLS_ENABLED=true \
-  -e MQTT_USERNAME=your-username \
-  -e MQTT_PASSWORD=your-password \
+  -e MQTT_CA_CERT_PATH=/certs/CAs.crt \
+  -e MQTT_CLIENT_CERT_PATH=/certs/client.crt \
+  -e MQTT_PRIVATE_KEY_PATH=/certs/client.key \
+  -e MQTT_CLIENT_ID=tlohman-flight-monitor \
   -e MQTT_TOPIC=update_drone \
   -e SESSION_SOURCE_MODE=aws \
   -e FINALIZE_TO_API=true \
+  -e TRACKER_FINALIZED_URL=http://your-sade-host.example.com/tracker-session-finalized \
   -e LOG_LEVEL=INFO \
   sade-telemetry-monitor:latest
 ```
@@ -185,8 +255,13 @@ docker run -d --restart unless-stopped \
 | `MQTT_TLS_ENABLED` | `false` | Set `true` for cloud/managed brokers |
 | `MQTT_USERNAME` | _(unset)_ | Pass at runtime — do not bake into image |
 | `MQTT_PASSWORD` | _(unset)_ | Pass at runtime — do not bake into image |
+| `MQTT_CA_CERT_PATH` | `/certs/CAs.crt` | Path inside the container to the CA cert used to verify the broker. Required for AWS IoT Core mTLS. |
+| `MQTT_CLIENT_CERT_PATH` | `/certs/client.crt` | Path inside the container to your signed client certificate. Required for AWS IoT Core mTLS. |
+| `MQTT_PRIVATE_KEY_PATH` | `/certs/client.key` | Path inside the container to your private key. **Never bake key material into the image** — mount it via `-v /host/sade-certs:/certs:ro` or ECS secrets. Required for AWS IoT Core mTLS. |
+| `MQTT_CLIENT_ID` | _(unset — **required for AWS IoT Core**)_ | Stable MQTT client identifier. AWS IoT Core policies typically restrict which client IDs a given cert may use; paho's random default will be silently rejected and the MQTT CONNECT will hang. Pick a deployment-specific ID (e.g. `tlohman-flight-monitor`). Only one connection may use a given ID at a time. |
 | `SESSION_SOURCE_MODE` | `aws` | `aws` requires approval webhook; `local` auto-creates sessions |
 | `FINALIZE_TO_API` | `true` | POST finalization to SADE AWS on mission complete |
+| `TRACKER_FINALIZED_URL` | _(unset — **required** when `FINALIZE_TO_API=true`)_ | Full URL of the SADE `/tracker-session-finalized` endpoint for the target environment. Pipeline startup fails fast if unset while finalization is enabled. |
 | `MISSION_ROWS_OUT` | `""` | Empty = CSV disabled. Set to a path inside a mounted volume to enable |
 | `WORKER_COUNT` | `1` | Number of async telemetry worker tasks |
 | `QUEUE_SIZE` | `10000` | Max buffered MQTT messages |
@@ -196,15 +271,21 @@ docker run -d --restart unless-stopped \
 
 ### Exposed port
 
-`8000` — FastAPI webhook server (`POST /entry-approval`, `GET /health`)
+`8000` — FastAPI webhook server:
+- `POST /flight-monitor/register-session`
+- `POST /flight-monitor/exit-request`
+- `POST /entry-approval` (deprecated)
+- `GET /health`
 
 ### AWS deployment notes
 
-- **`/entry-approval` must be reachable by SADE** — place the container behind an ALB or NLB so SADE can POST approval events to this endpoint
+- **Flight-monitor endpoints must be reachable by SADE** — place the container behind an ALB or NLB so SADE can POST `/flight-monitor/register-session` and `/flight-monitor/exit-request` to this service
+- **`TRACKER_FINALIZED_URL` must be set** — this is a required env var when `FINALIZE_TO_API=true` (the container default). Pass the full URL of the target environment's `/tracker-session-finalized` endpoint via ECS task definition env, `docker run -e`, or equivalent. The pipeline refuses to start if it's unset while finalization is enabled.
 - **MQTT credentials** — pass `MQTT_USERNAME` and `MQTT_PASSWORD` via ECS task definition secrets or AWS Secrets Manager; never bake them into the image
-- **AWS IoT Core** — set `MQTT_TLS_ENABLED=true`, `MQTT_BROKER_PORT=8883`, and configure an IoT Core policy to allow subscribe on the telemetry topic
+- **PKI for AWS IoT Core** — mount your CA cert, client cert, and private key as a read-only volume at `/certs/` (`-v ~/sade-certs:/certs:ro`). The pipeline reads them via `MQTT_CA_CERT_PATH`, `MQTT_CLIENT_CERT_PATH`, and `MQTT_PRIVATE_KEY_PATH`. Never `COPY` key material into the image. For ECS, store the private key in AWS Secrets Manager and mount it through the `secrets` section of the task definition.
+- **AWS IoT Core** — set `MQTT_TLS_ENABLED=true`, `MQTT_BROKER_PORT=8883`, and configure an IoT Core policy attached to your client cert that allows `iot:Connect`, `iot:Subscribe`, and `iot:Receive` on the telemetry topic
 - **CSV output** — disabled by default in the container; mount an EFS volume and set `MISSION_ROWS_OUT=/data/mission_rows.csv` to enable it
-- **Startup order** — the container connects to MQTT immediately on start; if the broker isn't reachable the pipeline logs an error but the FastAPI server still comes up and accepts approval events
+- **Startup order** — the container connects to MQTT immediately on start; if the broker isn't reachable the pipeline logs an error but the FastAPI server still comes up and accepts registration events
 
 ---
 
@@ -214,13 +295,15 @@ docker run -d --restart unless-stopped \
 sade/
 ├── run.py                          # Thin entry point — calls app.main.main()
 ├── requirements.txt
+├── Dockerfile
 │
 ├── app/
-│   ├── main.py                     # Wires all components, parses args, runs asyncio pipeline
+│   ├── main.py                     # Wires all components, parses args, runs the combined service
 │   │
 │   ├── api/
-│   │   ├── server.py               # FastAPI app — POST /entry-approval, GET /health
-│   │   └── approval_handler.py     # Pydantic model + business logic for approval events
+│   │   ├── server.py               # FastAPI app — register-session, exit-request, (deprecated) entry-approval, /health
+│   │   ├── approval_handler.py     # Pydantic models + logic for register-session and legacy entry-approval
+│   │   └── exit_handler.py         # Pydantic model + logic for exit-request events
 │   │
 │   ├── ingestion/
 │   │   ├── mqtt_client.py          # Paho MQTT client, bridges callbacks → asyncio.Queue
@@ -235,7 +318,7 @@ sade/
 │   │   └── mission_row_schema.py        # Column definitions and default row shape
 │   │
 │   ├── sending/
-│   │   └── tracker_finalizer.py    # POST /tracker-session-finalized to SADE AWS API
+│   │   └── tracker_finalizer.py    # POST /tracker-session-finalized to SADE AWS API, with retry
 │   │
 │   ├── common/
 │   │   └── mission_row_writer.py   # Thread-safe CSV writer
@@ -244,24 +327,34 @@ sade/
 │
 ├── local_testing/
 │   ├── drone_sim.py                # Simulates a drone: publishes MQTT telemetry + mission lifecycle
-│   ├── mqtt_publisher_client       # Low-level MQTT publish helper used by drone_sim
+│   ├── mqtt_publisher_client/      # Low-level MQTT publish helper used by drone_sim
 │   ├── drone_mqtt_client.py        # Standalone drone MQTT client
 │   └── local_testing_run_guide.txt # Notes on running local tests manually
 │
 ├── scripts/
-│   ├── run_local_test.py           # Full local integration test harness
 │   └── run_worker_comparison.py    # Benchmarks 1/2/4 worker configurations
 │
 ├── missions/
 │   ├── sample_mission.json         # Example mission waypoint data
 │   └── fly_waypoints_mission.json
 │
-├── tests/                          # Test directory (currently empty)
+├── tests/
+│   ├── unit/
+│   │   ├── api/                    # test_approval_handler, test_exit_handler
+│   │   ├── ingestion/              # test_workers
+│   │   ├── monitoring/             # registry, mission row builder, metrics, state tracker
+│   │   └── sending/                # test_tracker_finalizer
+│   └── integration/
+│       ├── test_mqtt_telemetry_pipeline.py     # full MQTT → finalization roundtrip
+│       ├── test_stub_finalization_override.py  # test_overrides stub path
+│       └── test_exit_request_grace_period.py   # exit-request + grace period
 │
 └── SADE_AWS_API_INFORMATION/       # SADE API reference docs
     ├── START_HERE.md
     ├── OPERATOR_LIFECYCLE.md
     ├── API_REFERENCE.md
+    ├── FLIGHT_MONITOR_CONTRACT.md
+    ├── EXIT_REQUEST_GUIDE.md
     └── IDEMPOTENCY_RECOMMENDATIONS.md
 ```
 
@@ -290,24 +383,30 @@ Mission completion is detected by matching `mission_status` against a set of kno
 **Blocking HTTP calls run in a thread**
 `post_tracker_session_finalized()` uses `asyncio.to_thread()` to run `urllib.request.urlopen` without blocking the event loop. No additional HTTP library dependency needed — consistent with how the test harness's health-check polling works.
 
+**Bounded retry on finalization POST**
+`post_tracker_session_finalized()` retries up to 2 times with `[1s, 2s]` exponential backoff. 5xx responses and network/transport errors are retried; 4xx responses are not (the payload is invalid — retrying won't change the outcome). SADE deduplicates on `flight_session_id`, so retrying is safe. Business-level `FAILED` responses are logged but not retried.
+
+**Two finalization trigger paths share one payload shape**
+Both the normal terminal-MQTT-status path and the exit-request grace-period path produce payloads via `build_finalization_payload()` from the accumulated `DroneState`. The `test_overrides` stub path uses `build_stub_finalization_payload()` to synthesize an equivalent-shaped payload from the override dict. This keeps the SADE-facing contract identical regardless of how the session finalizes.
+
+**Exit grace period keeps the session live**
+On `exit-request`, the session is NOT removed up front — it stays in the registry so MQTT telemetry continues to be accepted and accumulated during the grace period. A background task polls every 30s and only finalizes after 5 minutes of continuous silence. This ensures we capture the drone's final telemetry as it leaves the zone rather than cutting off mid-flight.
+
 ---
 
 ## What still needs to be done
 
-**Real SADE approval webhook integration**
-Currently the `POST /entry-approval` endpoint is called by the local test harness with synthetic payloads. In production, SADE needs to be configured to POST to this service's `/entry-approval` endpoint when a drone session is approved. The payload shape and auth mechanism (if any) need to be confirmed against the live SADE webhook contract.
+**Authentication on the webhook endpoints**
+`/flight-monitor/register-session` and `/flight-monitor/exit-request` have no auth. Any caller that can reach the port can register or close out a session. For production, this needs at minimum a shared secret header check, ideally mTLS or IAM-signed requests depending on the deployment environment.
 
-**Authentication on the approval endpoint**
-The `/entry-approval` endpoint has no auth. Any caller can register a session. For production, this needs at minimum a shared secret header check, ideally mTLS or IAM-signed requests depending on the deployment environment.
+**Remove the deprecated `/entry-approval` endpoint**
+Kept for backward compatibility during migration to the contract-aligned `/flight-monitor/register-session`. Once all callers are on the new endpoint, `/entry-approval`, its handler, and its tests can be removed.
 
 **Battery percentage fields**
-`battery_start_pct` and `battery_end_pct` are sent as `0.0` in every finalization report. The current telemetry payload only carries voltage, not percentage. Either the drone firmware needs to add a percentage field, or the service needs a voltage-to-percentage conversion curve per battery type.
+`battery_start_pct` and `battery_end_pct` are sent as `0.0` in every finalization report built from real telemetry. The current telemetry payload only carries voltage, not percentage. Either the drone firmware needs to add a percentage field, or the service needs a voltage-to-percentage conversion curve per battery type.
 
 **CSV output is not production output**
 The CSV writer was built for local observation and debugging. The finalization API call (`--finalize-to-api`) is the production path. The CSV should be treated as a diagnostic tool, not a record of truth.
-
-**No unit or integration tests**
-The `tests/` directory exists but is empty. The local test harness (`scripts/run_local_test.py`) covers the happy path end-to-end, but there are no unit tests for the worker parsing logic, state accumulator, finalization payload builder, or approval handler.
 
 **Worker count tuning**
 The pipeline defaults to 1 async worker. The `scripts/run_worker_comparison.py` benchmark showed diminishing returns beyond 1–2 workers at current message rates since the bottleneck is I/O bound, but this should be validated under real production load with concurrent drones.
@@ -319,4 +418,4 @@ A `Dockerfile` exists and the image builds and runs. A `docker-compose.yml` that
 `app/missions/` is a placeholder. The drone simulator uses static waypoint JSON files but the production service has no awareness of planned vs. actual flight paths. Distance flown, route deviation, and waypoint compliance are not computed.
 
 **Idle drone cleanup**
-If a drone registers a session and then goes silent without ever sending a terminal status (e.g., crash, lost comms), its state lives in memory indefinitely. There is no TTL or watchdog that cleans up stale in-flight sessions.
+If a drone registers a session and then goes silent without ever sending a terminal status or exit request (e.g., crash, lost comms), its state lives in memory indefinitely. There is no TTL or watchdog that cleans up stale in-flight sessions outside the exit-request path.
