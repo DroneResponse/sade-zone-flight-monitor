@@ -13,7 +13,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from math import asin, cos, radians, sin, sqrt
 from typing import Any
+
+# Mean Earth radius, used by the haversine great-circle distance formula.
+# Accuracy is ~0.3% vs. the true WGS-84 ellipsoid — well within the tolerance
+# expected for a flight-path total-distance metric.
+_EARTH_RADIUS_M = 6_371_000.0
 
 
 @dataclass
@@ -35,6 +41,7 @@ class DroneState:
     min_altitude: float | None = None
     voltage_in: float | None = None
     voltage_out: float | None = None
+    distance_flown_m: float = 0.0
     message_count: int = 0
     row_written: bool = False
 
@@ -91,6 +98,21 @@ class DroneStateTracker:
         existing.latest_parsed_payload = parsed_payload
         existing.mission_status = mission_status
         existing.mode = mode
+
+        # Accumulate great-circle distance from the previous GPS fix to the new
+        # one before overwriting ``existing.position``.  Raw accumulator — no
+        # jitter filtering.  A stationary drone with noisy GPS can add small
+        # phantom distances over many samples; accepted as a known tradeoff.
+        if position is not None and existing.position is not None:
+            prev_lat = _safe_float(existing.position.get("latitude"))
+            prev_lon = _safe_float(existing.position.get("longitude"))
+            new_lat = _safe_float(position.get("latitude"))
+            new_lon = _safe_float(position.get("longitude"))
+            if None not in (prev_lat, prev_lon, new_lat, new_lon):
+                existing.distance_flown_m += _haversine_m(
+                    prev_lat, prev_lon, new_lat, new_lon,
+                )
+
         existing.position = position
         existing.message_count += 1
 
@@ -148,3 +170,17 @@ def _safe_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance between two (lat, lon) points, in meters.
+
+    Uses the haversine formula with a spherical Earth approximation.  Accurate
+    to ~0.3 % vs. the true WGS-84 ellipsoid — sufficient for aggregate
+    flight-path distance.
+    """
+    lat1r, lat2r = radians(lat1), radians(lat2)
+    dlat = radians(lat2 - lat1)
+    dlon = radians(lon2 - lon1)
+    a = sin(dlat / 2) ** 2 + cos(lat1r) * cos(lat2r) * sin(dlon / 2) ** 2
+    return 2 * _EARTH_RADIUS_M * asin(sqrt(a))

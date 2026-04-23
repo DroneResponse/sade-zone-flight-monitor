@@ -171,6 +171,33 @@ python tests/integration/test_exit_request_grace_period.py
 
 The unit suite covers the approval handler, exit handler, MQTT workers, active session registry, mission row builder, pipeline metrics, state tracker, and tracker finalizer. The integration scripts each exercise one end-to-end slice: MQTT telemetry → finalization, `test_overrides` stub path, and exit-request grace period.
 
+### End-to-end test against real AWS (IoT Core + SADE)
+
+`scripts/run_e2e_aws_test.py` exercises the complete production code path against real AWS infrastructure — mTLS to IoT Core, real outbound POST to SADE's `/tracker-session-finalized`. It spawns the Flight Monitor as a subprocess, plays SADE's outbox role by POSTing `/flight-monitor/register-session` locally, then plays the drone role by publishing real MQTT telemetry to IoT Core using the same mTLS cert (with a distinct `client_id`). Success means the Flight Monitor's log shows `Tracker session finalized: ... reputation_record_id=<id>` — i.e. SADE persisted a real reputation record.
+
+Because this test writes a real record to SADE's database, it is **not** part of the pytest suite. Run it manually on branch merges or before major deploys, not per-commit.
+
+**Prerequisites:**
+- A configured `.env` with real cert paths, `MQTT_CLIENT_ID`, and `TRACKER_FINALIZED_URL` set to the SADE ALB endpoint (or use `--dry-run` to skip the real POST)
+- Cert files present on disk at the configured paths
+- Port 8000 free on localhost
+- An IoT Core policy on your cert that allows `iot:Connect` / `iot:Subscribe` on `update_drone` (for the Flight Monitor role) and `iot:Publish` on `update_drone` (for the drone role)
+
+**Run it:**
+
+```bash
+# Full end-to-end including real SADE POST
+python scripts/run_e2e_aws_test.py
+
+# Dry run — exercises everything up to but not including the SADE POST
+python scripts/run_e2e_aws_test.py --dry-run
+
+# Tuning knobs
+python scripts/run_e2e_aws_test.py --telemetry-count 20 --telemetry-interval 0.25
+```
+
+Artifacts land in `local_test_output/`: `e2e_aws_summary.txt` with the step-by-step verdict, `e2e_aws_flight_monitor.log` (full subprocess output), and `e2e_aws_runner.log` (harness's own activity). Exit code 0 on pass, 1 on fail.
+
 ### Key CLI flags
 
 | Flag | Default | Description |

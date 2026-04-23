@@ -29,6 +29,11 @@ class MissionRowBuilder:
         if state.max_altitude is not None:
             row["flight.max_alt_asl_m"] = int(round(state.max_altitude))
 
+        # Convert the meter-accumulator to miles for the legacy CSV schema.
+        # The upstream accumulator stays in meters (matches SADE's expected
+        # telemetry_summary.distance_flown_m field); this conversion is CSV-only.
+        row["flight.distance_flown_mi"] = round(state.distance_flown_m * 0.000621371, 3)
+
         start_position = state.start_position or {}
         row["flight.start_lat"] = start_position.get("latitude")
         row["flight.start_lon"] = start_position.get("longitude")

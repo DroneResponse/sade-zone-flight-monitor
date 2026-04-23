@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the 75-drone stress test with workers=2,4,8 and produce a comparison file.
+"""Run the 100-drone stress test with workers=2,4,8 and produce a comparison file.
 
 This reuses ``scripts/run_stress_test.py`` by invoking it once per worker count
 with a distinct ``--label``, so each run gets its own summary / CSV / logs.
@@ -22,9 +22,15 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_DIR = REPO_ROOT / "local_test_output"
 STRESS_RUNNER = REPO_ROOT / "scripts" / "run_stress_test.py"
-COMPARISON_PATH = OUTPUT_DIR / "stress_test_75_drones_worker_comparison.txt"
 
 WORKER_COUNTS = [2, 4, 8]
+
+# Must match DRONE_COUNT in run_stress_test.py — kept here so the sweep can
+# build matching filenames and expected-row counts without importing the
+# runner module.
+DRONE_COUNT = 100
+
+COMPARISON_PATH = OUTPUT_DIR / f"stress_test_{DRONE_COUNT}_drones_worker_comparison.txt"
 
 
 # Same regexes as run_stress_test.py — duplicated here so the comparison runner
@@ -90,7 +96,7 @@ class SweepRun:
 def output_paths_for(worker_count: int) -> tuple[str, Path, Path, Path, Path]:
     """Return (label, summary, csv, runner_log, mosquitto_log) for a worker count."""
     label = f"{worker_count}workers"
-    prefix = OUTPUT_DIR / f"stress_test_75_drones_{label}"
+    prefix = OUTPUT_DIR / f"stress_test_{DRONE_COUNT}_drones_{label}"
     return (
         label,
         prefix.with_name(prefix.name + "_summary.txt"),
@@ -167,7 +173,7 @@ def write_comparison(runs: list[SweepRun], comparison_path: Path) -> None:
         return f"{value:,.{precision}f}"
 
     rows: list[list[str]] = [
-        ["Final rows (expected 75)"] + [fmt_int(r.final_rows) for r in runs],
+        [f"Final rows (expected {DRONE_COUNT})"] + [fmt_int(r.final_rows) for r in runs],
         ["Enqueued messages"] + [fmt_int(r.enqueued) for r in runs],
         ["Processed messages"] + [fmt_int(r.processed) for r in runs],
         ["Publisher total (published)"] + [fmt_int(r.published_total) for r in runs],
@@ -187,14 +193,14 @@ def write_comparison(runs: list[SweepRun], comparison_path: Path) -> None:
     widths = [max(len(headers[col]), *(len(row[col]) for row in rows)) for col in range(len(headers))]
 
     lines: list[str] = []
-    lines.append("75-Drone Stress Test — Worker Count Comparison")
-    lines.append("==============================================")
+    lines.append(f"{DRONE_COUNT}-Drone Stress Test — Worker Count Comparison")
+    lines.append("=" * len(lines[-1]))
     lines.append("")
     lines.append("Scenario (identical across all runs)")
     lines.append("------------------------------------")
     lines.append(
-        "75 drones, 0.1s publish interval (10 msg/s per drone), groups of 15 staggered "
-        "10s apart, 300s per-drone runtime, queue size 20000, RSS sampled every 2s."
+        f"{DRONE_COUNT} drones, 0.1s publish interval (10 msg/s per drone), groups of 15 staggered "
+        "10s apart, 300s per-drone runtime, queue size 30000, RSS sampled every 2s."
     )
     lines.append("Only the worker count varies.")
     lines.append("")

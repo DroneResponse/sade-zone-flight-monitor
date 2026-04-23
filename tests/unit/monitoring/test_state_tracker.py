@@ -289,6 +289,75 @@ class TestMultipleSessions:
         assert state_b.voltage_out == 15.0
 
 
+# ── Distance flown accumulation ─────────────────────────────────────────────
+
+
+class TestDistanceFlown:
+    def test_starts_zero_on_first_message(self):
+        tracker = DroneStateTracker()
+        state = _do_update(tracker, position=_make_position(lat=39.77, lon=-86.16))
+
+        assert state.distance_flown_m == 0.0
+
+    def test_accumulates_one_hop_at_equator(self):
+        """Two points ~1° apart at the equator ≈ 111 km great-circle distance."""
+        tracker = DroneStateTracker()
+        _do_update(tracker, position=_make_position(lat=0.0, lon=0.0))
+        state = _do_update(tracker, position=_make_position(lat=0.0, lon=1.0))
+
+        # Known benchmark: 1° longitude at the equator is ~111_320 m.
+        # Allow 200 m slack for the spherical-Earth approximation.
+        assert state.distance_flown_m == pytest.approx(111_320, abs=200)
+
+    def test_additive_across_multiple_hops(self):
+        """Three points form two segments; the total equals the sum of pairwise distances."""
+        tracker = DroneStateTracker()
+        _do_update(tracker, position=_make_position(lat=39.0, lon=-86.0))
+        # Hop 1: ~11.1 km north.
+        _do_update(tracker, position=_make_position(lat=39.1, lon=-86.0))
+        # Hop 2: ~8.6 km east at latitude 39.1 (cos(39.1°) × 111.32 km per degree lon).
+        state = _do_update(tracker, position=_make_position(lat=39.1, lon=-85.9))
+
+        # Expected ≈ 11_132 + 8_632 ≈ 19_764 m.  1% tolerance handles the
+        # spherical approximation and the cosine latitude correction.
+        assert state.distance_flown_m == pytest.approx(19_764, rel=0.02)
+
+    def test_zero_for_stationary_drone(self):
+        """Identical consecutive positions should not add any distance."""
+        tracker = DroneStateTracker()
+        pos = _make_position(lat=39.0, lon=-86.0)
+        _do_update(tracker, position=pos)
+        state = _do_update(tracker, position=dict(pos))
+
+        assert state.distance_flown_m == 0.0
+
+    def test_unchanged_when_new_position_missing(self):
+        """A message without a position should not change the accumulator."""
+        tracker = DroneStateTracker()
+        _do_update(tracker, position=_make_position(lat=39.0, lon=-86.0))
+        state = _do_update(tracker, position=None)
+
+        assert state.distance_flown_m == 0.0
+
+    def test_independent_per_session(self):
+        """Two sessions should not leak distance into each other."""
+        tracker = DroneStateTracker()
+
+        # Session A: short hop (~111 km).
+        _do_update(tracker, "flight-A", drone_id="drone-A", position=_make_position(lat=0.0, lon=0.0))
+        _do_update(tracker, "flight-A", drone_id="drone-A", position=_make_position(lat=0.0, lon=1.0))
+
+        # Session B: stays put.
+        _do_update(tracker, "flight-B", drone_id="drone-B", position=_make_position(lat=10.0, lon=10.0))
+        _do_update(tracker, "flight-B", drone_id="drone-B", position=_make_position(lat=10.0, lon=10.0))
+
+        state_a = tracker.get("flight-A")
+        state_b = tracker.get("flight-B")
+
+        assert state_a.distance_flown_m == pytest.approx(111_320, abs=200)
+        assert state_b.distance_flown_m == 0.0
+
+
 # ── _extract_voltage() ──────────────────────────────────────────────────────
 
 

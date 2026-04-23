@@ -21,6 +21,7 @@ def _make_drone_state(
     position: dict | None = None,
     voltage_in: float | None = 16.4,
     voltage_out: float | None = 14.9,
+    distance_flown_m: float = 0.0,
     mission_status: str | None = "mission_completed",
     mode: str | None = "AUTO",
 ) -> DroneState:
@@ -37,6 +38,7 @@ def _make_drone_state(
         position=position,
         voltage_in=voltage_in,
         voltage_out=voltage_out,
+        distance_flown_m=distance_flown_m,
         mission_status=mission_status,
         mode=mode,
         message_count=10,
@@ -193,6 +195,31 @@ class TestBuildRowVoltage:
         row = BUILDER.build_row(state)
 
         assert row["battery.voltage_in"] == {"A": 16.123}
+
+
+# ── build_row(): distance flown ──────────────────────────────────────────────
+
+
+class TestBuildRowDistanceFlown:
+    def test_converts_meters_to_miles(self):
+        # 1609.344 m is exactly 1 mile — good canonical value to pin conversion.
+        state = _make_drone_state(distance_flown_m=1609.344)
+        row = BUILDER.build_row(state)
+
+        assert row["flight.distance_flown_mi"] == 1.0
+
+    def test_zero_distance(self):
+        state = _make_drone_state(distance_flown_m=0.0)
+        row = BUILDER.build_row(state)
+
+        assert row["flight.distance_flown_mi"] == 0.0
+
+    def test_rounded_to_three_decimals(self):
+        # 100 m ≈ 0.062137 mi; output should round to 3 decimals.
+        state = _make_drone_state(distance_flown_m=100.0)
+        row = BUILDER.build_row(state)
+
+        assert row["flight.distance_flown_mi"] == 0.062
 
 
 # ── build_row(): mission status and mode ─────────────────────────────────────

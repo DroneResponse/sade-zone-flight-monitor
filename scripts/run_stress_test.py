@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""Run a 75-drone stress test against the telemetry ingestion pipeline.
+"""Run a 100-drone stress test against the telemetry ingestion pipeline.
 
 Scenario:
-- 75 simulated drones publishing telemetry every 0.1s (750 msg/s sustained).
-- Drones start in groups of 15, staggered 10s apart (50s total ramp).
-- Each drone runs for 300s, so the full scenario covers ~350s of sustained load.
-- Pipeline configured with 2 workers and a 20000-slot queue.
+- 100 simulated drones publishing telemetry every 0.1s (1000 msg/s sustained).
+- Drones start in groups of 15, staggered 10s apart (~60s total ramp).
+- Each drone runs for 300s, so the full scenario covers ~360s of sustained load.
+- Pipeline configured with 2 workers (by default) and a 30000-slot queue.
 - RSS is sampled every 2s inside the pipeline process.
 
 Outputs (under ``local_test_output/``):
-- ``stress_test_75_drones_summary.txt``  — human-readable summary
-- ``stress_test_75_drones_rows.csv``     — one row per finalized drone mission
-- ``stress_test_75_drones_runner.log``   — full runner + pipeline + API logs
-- ``stress_test_75_drones_mosquitto.log``— broker log
+- ``stress_test_100_drones_summary.txt``  — human-readable summary
+- ``stress_test_100_drones_rows.csv``     — one row per finalized drone mission
+- ``stress_test_100_drones_runner.log``   — full runner + pipeline + API logs
+- ``stress_test_100_drones_mosquitto.log``— broker log
 
 The summary includes:
 - Throughput (enqueued/s, processed/s)
@@ -38,20 +38,20 @@ OUTPUT_DIR = REPO_ROOT / "local_test_output"
 INTEGRATION_RUNNER = REPO_ROOT / "tests" / "integration" / "test_mqtt_telemetry_pipeline.py"
 
 # ── Scenario parameters ───────────────────────────────────────────────────────
-DRONE_COUNT = 75
+DRONE_COUNT = 100
 PUBLISH_INTERVAL_SECONDS = 0.1
 GROUP_SIZE = 15
 GROUP_STAGGER_SECONDS = 10.0
 PUBLISHER_RUNTIME_SECONDS = 300.0
 DEFAULT_WORKER_COUNT = 2
-QUEUE_SIZE = 20000
+QUEUE_SIZE = 30000
 METRICS_LOG_INTERVAL = 10.0
 MEMORY_SAMPLE_INTERVAL = 2.0
 
 
 def build_output_paths(label: str) -> tuple[Path, Path, Path, Path]:
     """Return (summary, csv, runner_log, mosquitto_log) paths for a run label."""
-    prefix = OUTPUT_DIR / f"stress_test_75_drones_{label}"
+    prefix = OUTPUT_DIR / f"stress_test_{DRONE_COUNT}_drones_{label}"
     return (
         prefix.with_name(prefix.name + "_summary.txt"),
         prefix.with_name(prefix.name + "_rows.csv"),
@@ -131,7 +131,7 @@ def build_command(
     runner_log_path: Path,
     mosquitto_log_path: Path,
 ) -> list[str]:
-    """Build the subprocess command for the 75-drone scenario."""
+    """Build the subprocess command for the 100-drone scenario."""
     return [
         sys.executable,
         str(INTEGRATION_RUNNER),
@@ -214,7 +214,7 @@ def run_stress_test(
     runner_log_path: Path,
     mosquitto_log_path: Path,
 ) -> StressTestResult:
-    """Run the 75-drone stress scenario and parse results from its logs."""
+    """Run the 100-drone stress scenario and parse results from its logs."""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     # Fresh outputs each run so summaries are never computed from stale data.
@@ -294,7 +294,7 @@ def write_summary(
     broker_drop_rate = _pct(broker_drop, result.published_total)
 
     lines: list[str] = []
-    lines.append("75-Drone Stress Test Summary")
+    lines.append(f"{DRONE_COUNT}-Drone Stress Test Summary")
     lines.append("============================")
     lines.append("")
     lines.append("Scenario")
@@ -385,7 +385,7 @@ def write_summary(
 
 def main() -> int:
     """Run the stress test and write the summary."""
-    parser = argparse.ArgumentParser(description="Run a 75-drone stress test scenario")
+    parser = argparse.ArgumentParser(description=f"Run a {DRONE_COUNT}-drone stress test scenario")
     parser.add_argument(
         "--workers",
         type=int,
@@ -397,7 +397,7 @@ def main() -> int:
         default=None,
         help=(
             "Suffix for output filenames. Defaults to '{N}workers' so sweeps "
-            "write to stress_test_75_drones_{label}_*.{csv,txt,log}."
+            "write to stress_test_<drone_count>_drones_{label}_*.{csv,txt,log}."
         ),
     )
     args = parser.parse_args()
