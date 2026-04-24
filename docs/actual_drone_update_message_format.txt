@@ -1,0 +1,196 @@
+Actual drone update_drone message format
+========================================
+Source: provided by Thomas from the DR-OnboardAutonomy repo.
+The following is the terminal capture / notes as shared:
+
+(base) uav@jcws-15:~/drone-response$ cd DR-OnboardAutonomy/
+direnv: error /home/uav/drone-response/DR-OnboardAutonomy/.envrc is blocked. Run `direnv allow` to approve its content
+(base) uav@jcws-15:~/drone-response/DR-OnboardAutonomy$ direnv allow
+direnv: loading ~/drone-response/DR-OnboardAutonomy/.envrc
+direnv: PS1 cannot be exported. For more information see https://github.com/direnv/direnv/wiki/PS1
+direnv: export +VIRTUAL_ENV +VIRTUAL_ENV_PROMPT ~PATH
+(base) uav@jcws-15:~/drone-response/DR-OnboardAutonomy$ ls venv
+bin  include  lib  lib64  pyvenv.cfg
+(base) uav@jcws-15:~/drone-response/DR-OnboardAutonomy$ ^C
+(base) uav@jcws-15:~/drone-response/DR-OnboardAutonomy$
+
+
+Example update_drone JSON message (actual on-wire payload)
+----------------------------------------------------------
+{
+  "uavid": "Orange",
+  "status": {
+    "status": "STANDBY",
+    "mode": "LOITER",
+    "onboard_pilot": "ReceiveMission",
+    "state_type": "ReceiveMission",
+    "speed": 0.01,
+    "location": {
+      "latitude": 41.7547272,
+      "longitude": -86.191418,
+      "altitude": 254.19506772412188
+    },
+    "armed": false,
+    "battery": {
+      "voltage": 16.200000762939453,
+      "current": 1.0,
+      "level": 1.0
+    },
+    "geofence": false,
+    "heartbeat_status": "CONTINUE",
+    "drone_attitude": {
+      "x": -0.003145496683347652,
+      "y": -0.008831936972091822,
+      "z": 0.0638582496122505,
+      "w": -0.9979149361430464
+    },
+    "drone_heading": 97.31,
+    "gimbal_attitude": null,
+    "gimbal_heading": null,
+    "air_lease_state": "IDLE"
+  },
+  "timestamp": "2026-04-24T21:03:42.105+00:00"
+}
+
+
+Notes on how this maps to the Flight Monitor's ingestion layer
+--------------------------------------------------------------
+Fields currently consumed by parse_queue_message / state_tracker:
+
+  uavid                              -> drone_id (registry correlation key)
+  status.status                      -> mission_status fallback when
+                                        top-level "mission_status" is absent
+                                        (see note below)
+  status.mode                        -> mode (CSV entry_conditions)
+  status.location.{lat,lon,altitude} -> position, altitude min/max,
+                                        distance_flown_m (haversine)
+  status.battery.voltage             -> voltage_in / voltage_out ->
+                                        per-segment slots[] in finalization
+  timestamp                          -> not used; Flight Monitor stamps
+                                        first_seen / last_seen with its own
+                                        receipt wall-clock
+
+Fields present on the wire but not yet consumed:
+
+  status.armed                       -> AUTHORITATIVE ARM STATE for future
+                                        FLIGHT_SEGMENT detection. This is
+                                        what the arm/disarm-based segment
+                                        detection plan needs — NO firmware
+                                        change required. Just wire up an
+                                        _extract_armed() reader in
+                                        state_tracker.update() and use it
+                                        to open/close segments. Proposed
+                                        "status.flight_state" is already
+                                        present as status.armed (bool).
+  status.battery.level               -> Candidate for system_charge_pct.
+                                        Currently placeholder 0.0 in the
+                                        finalization payload — if "level"
+                                        is 0..1 fraction, multiply by 100;
+                                        if already 0..100, pass through.
+                                        Verify units with firmware team.
+  status.battery.current             -> Not mapped; could be useful for
+                                        per-segment energy estimation later.
+  status.speed                       -> Not mapped; candidate for
+                                        low-speed filtering in distance
+                                        accumulator to suppress GPS jitter
+                                        on stationary drones.
+  status.geofence                    -> Boolean; could feed an incident
+                                        heuristic once incident detection
+                                        is wired up.
+  status.heartbeat_status            -> Not mapped; may be useful as a
+                                        secondary "telemetry stale" signal.
+  status.onboard_pilot               -> Not mapped.
+  status.state_type                  -> Not mapped.
+  status.air_lease_state             -> Not mapped; this is SADE-granted
+                                        airspace lease state on the drone
+                                        side, potentially interesting for
+                                        cross-checking SADE-side session
+                                        state.
+  status.drone_attitude / heading    -> Not mapped.
+  status.gimbal_attitude / heading   -> Not mapped.
+
+Terminal mission_status values
+------------------------------
+Note: this real payload has NO top-level "mission_status" field. The
+simulator and the current ingestion parser both fall back to
+status.status for mission lifecycle. Values observed on the wire so far:
+  STANDBY    — drone online, idle, not flying
+  (others to be documented as we see them)
+
+The current worker.py terminal-status set (mission_completed, complete,
+done, ...) presumably maps to some value of status.status in real
+telemetry. Confirm with the firmware team what the terminal / landed /
+mission-done value actually is — we shouldn't assume the simulator's
+"mission_completed" string is what real drones emit. The cleanest fix
+once we know: extend the terminal-status set or migrate to
+status.armed == false + status.status in a known "landed" set.
+
+
+Additional real samples (multiple drones in the fleet)
+------------------------------------------------------
+Captured from a docker-compose style log that prefixes each line with
+the container name ("drone_2-1 |", "drone_4-1 |") and the MQTTClient
+publisher's own log line ("[INFO] [<epoch>.<ms>]: MQTTClient publishing
+to topic '<topic>' with QoS 0: <json>").
+
+drone_2-1 (uavid=Blue) publishing to topic 'status_message':
+{"uavid": "Blue", "status": {"status": "STANDBY", "mode": "LOITER", "onboard_pilot": "ReceiveMission", "state_type": "ReceiveMission", "speed": 0.01, "location": {"latitude": 41.7546352, "longitude": -86.1913143, "altitude": 254.20006830852464}, "armed": false, "battery": {"voltage": 16.200000762939453, "current": 1.0, "level": 1.0}, "geofence": false, "heartbeat_status": "CONTINUE", "drone_attitude": {"x": -0.0026183948603441263, "y": -0.007295150428909889, "z": 0.07090566629860567, "w": -0.9974529645365187}, "drone_heading": 98.11, "gimbal_attitude": null, "gimbal_heading": null, "air_lease_state": "IDLE"}, "timestamp": "2026-04-24T21:03:42.589+00:00"}
+
+drone_4-1 (uavid=Aqua) publishing to topic 'update_drone' (3 sequential publishes — see note below):
+{"uavid": "Aqua", "status": {"status": "STANDBY", "mode": "LOITER", "onboard_pilot": "ReceiveMission", "state_type": "ReceiveMission", "speed": 0.02, "location": {"latitude": 41.7547145, "longitude": -86.1912907, "altitude": 254.1870688046829}, "armed": false, "battery": {"voltage": 16.200000762939453, "current": 1.0, "level": 1.0}, "geofence": false, "heartbeat_status": "CONTINUE", "drone_attitude": {"x": -0.004859708781778674, "y": -0.00860624356176627, "z": 0.0670969820392216, "w": -0.9976975426984274}, "drone_heading": 97.68, "gimbal_attitude": null, "gimbal_heading": null, "air_lease_state": "IDLE"}, "timestamp": "2026-04-24T21:03:42.601+00:00"}
+{"uavid": "Aqua", "status": {"status": "STANDBY", "mode": "LOITER", "onboard_pilot": "ReceiveMission", "state_type": "ReceiveMission", "speed": 0.02, "location": {"latitude": 41.7547145, "longitude": -86.1912907, "altitude": 254.1870688046829}, "armed": false, "battery": {"voltage": 16.200000762939453, "current": 1.0, "level": 1.0}, "geofence": false, "heartbeat_status": "CONTINUE", "drone_attitude": {"x": -0.004859708781778674, "y": -0.00860624356176627, "z": 0.0670969820392216, "w": -0.9976975426984274}, "drone_heading": 97.68, "gimbal_attitude": null, "gimbal_heading": null, "air_lease_state": "IDLE"}, "timestamp": "2026-04-24T21:03:42.601+00:00"}
+{"uavid": "Aqua", "status": {"status": "STANDBY", "mode": "LOITER", "onboard_pilot": "ReceiveMission", "state_type": "ReceiveMission", "speed": 0.02, "location": {"latitude": 41.7547145, "longitude": -86.1912907, "altitude": 254.1870688046829}, "armed": false, "battery": {"voltage": 16.200000762939453, "current": 1.0, "level": 1.0}, "geofence": false, "heartbeat_status": "CONTINUE", "drone_attitude": {"x": -0.004859708781778674, "y": -0.00860624356176627, "z": 0.0670969820392216, "w": -0.9976975426984274}, "drone_heading": 97.68, "gimbal_attitude": null, "gimbal_heading": null, "air_lease_state": "IDLE"}, "timestamp": "2026-04-24T21:03:42.601+00:00"}
+
+
+Operational observations from the real samples
+----------------------------------------------
+1. TWO DIFFERENT TOPICS ARE IN USE.
+     - Drone "Orange" (first sample) and Drone "Aqua" publish to
+       'update_drone' — the topic the Flight Monitor subscribes to.
+     - Drone "Blue" publishes to 'status_message' — a DIFFERENT topic.
+       The Flight Monitor as configured today does NOT subscribe to
+       'status_message' and would drop every Blue telemetry packet.
+     Either all drones need to standardize on 'update_drone', or the
+     Flight Monitor needs to subscribe to both topics. Worth confirming
+     with the firmware / fleet team whether 'status_message' is legacy,
+     intentional, or drone-specific — and whether the payload schema is
+     identical on both topics (the Blue sample suggests yes).
+
+2. DUPLICATE PUBLISHES WITH IDENTICAL TIMESTAMPS.
+     Drone "Aqua" emitted the SAME payload THREE times, all with the
+     same "timestamp": "2026-04-24T21:03:42.601+00:00" and the same
+     field values (location, battery, heading, etc.). The broker
+     receipt timestamps (the "[1777064622.601...]" prefixes) differ
+     only in the MQTT client's own logging jitter.
+     Implications for the ingestion side:
+       - distance_flown_m is unaffected (great-circle distance between
+         identical coordinates is 0).
+       - message_count will be inflated by the dup factor — useful to
+         know when reasoning about the metric.
+       - If/when INCIDENT detection looks at rate-of-change signals,
+         it must dedupe by (uavid, timestamp) or it'll see flat regions
+         that are artifacts of the publisher retransmitting.
+     Ask the firmware team whether this is intentional (at-least-once
+     retransmit at the application layer) or a bug. If intentional,
+     document it; if not, it's a fix upstream.
+
+3. BROKER-SIDE PREFIX FORMAT.
+     The "drone_N-1 | [INFO] [<epoch>]: MQTTClient publishing to topic
+     '<topic>' with QoS 0: <json>" prefix is log noise from the
+     publisher's own MQTT client library, not part of the MQTT payload.
+     The Flight Monitor receives ONLY the JSON body from the broker —
+     none of the bracketed prefix. Keep that in mind when sharing
+     samples: strip the prefix before pasting into tests or fixtures.
+
+4. QoS 0.
+     Real publishers are using QoS 0 ("fire and forget"). That's what
+     the Flight Monitor's MQTT client is already configured for, and
+     it's consistent with the duplicate-publishes pattern above being
+     an application-layer retry rather than MQTT-layer redelivery.
+
+5. FLEET NAMING CONVENTION.
+     uavid values seen so far are colour names: Orange, Blue, Aqua.
+     This is human-readable rather than UUID-style. ActiveSessionRegistry
+     indexes on drone_id string-wise, so this works today, but worth
+     confirming whether colour-name IDs are globally unique across the
+     whole fleet or scoped per-deployment.
