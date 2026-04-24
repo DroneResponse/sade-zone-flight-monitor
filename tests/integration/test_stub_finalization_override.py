@@ -255,6 +255,24 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(name)s - %(message)s",
     )
 
+    # Fail fast if TRACKER_FINALIZED_URL is not set.  The stub finalize task
+    # needs it to POST to SADE — without it, registrations succeed and the
+    # stub tasks crash ~5 s later with a misleading "3 active sessions" test
+    # failure.  Catching the missing env var up front gives an actionable
+    # error before any server state is created.
+    from app.sending.tracker_finalizer import get_tracker_finalized_url
+    try:
+        get_tracker_finalized_url()
+    except RuntimeError as exc:
+        LOGGER.error(
+            "Pre-flight check failed: %s\n"
+            "Source your .env file before running this test, e.g.:\n"
+            "    set -a; . ./.env; set +a; python %s",
+            exc,
+            sys.argv[0],
+        )
+        return 2
+
     passed = asyncio.run(run_test(args))
 
     if passed:
