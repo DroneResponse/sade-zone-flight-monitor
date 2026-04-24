@@ -97,14 +97,26 @@ def build_test_registrations(count: int) -> list[dict]:
                 "priority": "NORMAL",
             },
             "test_overrides": {
-                "actual_start_time": "2026-04-21T18:05:00Z",
-                "actual_end_time": "2026-04-21T18:41:00Z",
                 "telemetry_summary": {
                     "altitude_min_m": 10.0 + i * 5,
                     "altitude_max_m": 80.0 + i * 10,
-                    "battery_start_pct": 98.0 - i,
-                    "battery_end_pct": 61.0 - i * 2,
+                    "distance_flown_m": 500.0 + i * 25,
                 },
+                "events": [
+                    {
+                        "type": "FLIGHT_SEGMENT",
+                        "time_in_utc": "2026-04-21T18:05:00Z",
+                        "time_out_utc": "2026-04-21T18:41:00Z",
+                        "battery_state_in": {
+                            "system_charge_pct": 98.0 - i,
+                            "slots": [{"slot_id": "A", "voltage_v": 24.8}],
+                        },
+                        "battery_state_out": {
+                            "system_charge_pct": 61.0 - i * 2,
+                            "slots": [{"slot_id": "A", "voltage_v": 23.9}],
+                        },
+                    },
+                ],
             },
             "submitted_at": "2026-04-21T17:55:00Z",
         })

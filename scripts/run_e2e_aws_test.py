@@ -75,7 +75,21 @@ PATTERNS: dict[str, re.Pattern[str]] = {
     "finalize_http_err":  re.compile(r"POST \S+ → HTTP (?P<code>[0-9]{3}) \| flight_session_id="),
     "finalize_failed":    re.compile(r"All \d+ finalization attempts failed for flight_session_id"),
     "business_failed":    re.compile(r"Tracker finalization business failure"),
+    "business_failure_detail": re.compile(
+        r"Tracker finalization business failure: flight_session_id=(?P<fsid>\S+) reason=(?P<reason>.+)$"
+    ),
 }
+
+
+# SADE returns status=FAILED with one of these reasons when our payload is
+# schema-valid but the referenced session doesn't exist / isn't finalizable.
+# For E2E runs that fabricate flight_session_ids locally (not pre-registered
+# in SADE's database) this is the expected-and-acceptable outcome — it proves
+# the contract is met.  Substring match, not exact, so minor wording drift on
+# SADE's side doesn't break the harness.
+EXPECTED_BUSINESS_FAILURE_REASONS = (
+    "No session found for tracker finalization report.",
+)
 
 
 # ── Env file parsing ─────────────────────────────────────────────────────────
@@ -178,6 +192,27 @@ class FlightMonitorRunner:
             return self.event_queues[name].get(timeout=timeout)
         except queue.Empty:
             return None
+
+    def wait_for_any(
+        self, names: list[str], timeout: float,
+    ) -> tuple[str, re.Match] | None:
+        """Block until any of the named patterns matches, or timeout.
+
+        Returns ``(name, match)`` for the first pattern that fires, or None
+        on timeout.  Used when multiple terminal signals are possible and we
+        want to return on whichever arrives first (e.g. finalize-success vs.
+        business-failure) instead of wasting the full per-signal timeout.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            for name in names:
+                try:
+                    match = self.event_queues[name].get_nowait()
+                    return (name, match)
+                except queue.Empty:
+                    continue
+            time.sleep(0.05)
+        return None
 
     def has_seen(self, name: str) -> bool:
         """Non-blocking check: did pattern ``name`` already match?"""
@@ -365,6 +400,16 @@ class E2EResult:
     telemetry_published: int = 0
     dry_run: bool = False
     steps_completed: list[str] = field(default_factory=list)
+    # True once SADE has returned any HTTP 200 response to the finalization
+    # POST — independent of the business-level status.  The real signal for
+    # "our contract is met".
+    schema_accepted: bool = False
+    # SADE's business-level status from the finalization response body:
+    # "EXITED" for success, "FAILED" for a business rejection, None if no
+    # response was received.
+    sade_business_status: str | None = None
+    # Passthrough of the `reason` field from SADE's business-level response.
+    sade_business_reason: str | None = None
 
 
 # ── Main orchestration ───────────────────────────────────────────────────────
@@ -551,17 +596,28 @@ def run_e2e(args: argparse.Namespace) -> E2EResult:
         result.steps_completed.append("finalize-posting")
 
         # Step 8: SADE response
+        #
+        # Two terminal log lines are possible here:
+        #   1. ``finalize_done``              — status=EXITED, reputation record created
+        #   2. ``business_failure_detail``    — HTTP 200 + status=FAILED + reason
+        #
+        # Both prove SADE accepted our payload's schema; we branch on the
+        # business-level status to decide PASS/FAIL.  A business FAILED whose
+        # reason matches the expected-harness-limitation whitelist is still a
+        # PASS, because the harness fabricates flight_session_ids that SADE
+        # has no record of.
         LOGGER.info("Waiting for SADE to respond with reputation record ...")
-        match = fm.wait_for("finalize_done", args.finalization_timeout)
-        if match is None:
+        hit = fm.wait_for_any(
+            ["finalize_done", "business_failure_detail"],
+            args.finalization_timeout,
+        )
+
+        if hit is None:
             result.failed_step = "finalize-response"
-            # Post-mortem: was it an HTTP error, a business failure, or just silence?
             if fm.has_seen("finalize_failed"):
                 result.reason = "all finalization retries failed — SADE did not respond successfully. Check runner log."
             elif fm.has_seen("finalize_http_err"):
                 result.reason = "SADE returned non-200 HTTP response. Check runner log for status code and body."
-            elif fm.has_seen("business_failed"):
-                result.reason = "SADE responded with status=FAILED. Check runner log for the reason."
             else:
                 result.reason = (
                     f"no finalization response within {args.finalization_timeout}s and no error logged — "
@@ -569,13 +625,38 @@ def run_e2e(args: argparse.Namespace) -> E2EResult:
                 )
             return result
 
-        result.reputation_record_id = match.group("rep")
-        LOGGER.info(
-            "[OK] SADE finalized: flight_session_id=%s reputation_record_id=%s",
-            match.group("fsid"), result.reputation_record_id,
-        )
-        result.steps_completed.append("finalize-done")
-        result.passed = True
+        signal_name, match = hit
+        result.schema_accepted = True
+        result.steps_completed.append("finalize-response")
+
+        if signal_name == "finalize_done":
+            result.sade_business_status = "EXITED"
+            result.reputation_record_id = match.group("rep")
+            LOGGER.info(
+                "[OK] SADE finalized: flight_session_id=%s reputation_record_id=%s",
+                match.group("fsid"), result.reputation_record_id,
+            )
+            result.passed = True
+            return result
+
+        # signal_name == "business_failure_detail" — schema accepted, business FAILED.
+        reason_text = match.group("reason").strip()
+        result.sade_business_status = "FAILED"
+        result.sade_business_reason = reason_text
+
+        if any(expected in reason_text for expected in EXPECTED_BUSINESS_FAILURE_REASONS):
+            LOGGER.info(
+                "[OK] SADE schema accepted; business FAILED as expected for fabricated session: %s",
+                reason_text,
+            )
+            result.passed = True
+        else:
+            LOGGER.error(
+                "SADE schema accepted but business FAILED with unexpected reason: %s",
+                reason_text,
+            )
+            result.failed_step = "finalize-response"
+            result.reason = f"SADE returned status=FAILED with unexpected reason: {reason_text!r}"
         return result
 
     finally:
@@ -594,7 +675,17 @@ def write_summary(args: argparse.Namespace, result: E2EResult) -> None:
     lines.append("")
 
     if result.passed:
-        verdict = "DRY-RUN PASSED" if result.dry_run else "PASSED"
+        if result.dry_run:
+            verdict = "DRY-RUN PASSED"
+        elif result.sade_business_status == "EXITED":
+            verdict = f"PASSED (SADE reputation_record_id={result.reputation_record_id})"
+        elif result.sade_business_status == "FAILED":
+            verdict = (
+                "PASSED (schema accepted; SADE business FAILED as expected "
+                f"for fabricated session: {result.sade_business_reason})"
+            )
+        else:
+            verdict = "PASSED"
     else:
         verdict = f"FAILED at step: {result.failed_step}"
     lines.append(f"Result: {verdict}")
@@ -626,10 +717,10 @@ def write_summary(args: argparse.Namespace, result: E2EResult) -> None:
         ("terminal-published",   "Published mission_completed"),
         ("final-row",            "Flight Monitor wrote final mission row"),
         ("finalize-posting",     "Finalization POST initiated"),
-        ("finalize-done",        "SADE responded with reputation_record_id"),
+        ("finalize-response",    "SADE responded (schema accepted)"),
     ]
     for name, label in all_steps:
-        if result.dry_run and name in {"finalize-posting", "finalize-done"}:
+        if result.dry_run and name in {"finalize-posting", "finalize-response"}:
             marker = "SKIP"
         elif name in result.steps_completed:
             marker = " OK "
@@ -640,8 +731,16 @@ def write_summary(args: argparse.Namespace, result: E2EResult) -> None:
         lines.append(f"  [{marker}] {label}")
 
     lines.append("")
-    if result.reputation_record_id:
-        lines.append(f"SADE reputation_record_id: {result.reputation_record_id}")
+    if result.schema_accepted:
+        lines.append("SADE response")
+        lines.append("-------------")
+        lines.append("HTTP status     : 200")
+        lines.append(f"Business status : {result.sade_business_status or '-'}")
+        if result.sade_business_reason:
+            lines.append(f"Reason          : {result.sade_business_reason}")
+        lines.append(
+            f"reputation_record_id : {result.reputation_record_id or '-'}"
+        )
         lines.append("")
 
     lines.append("Artifacts")

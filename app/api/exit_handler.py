@@ -83,6 +83,13 @@ def process_exit_request(
         }
 
     current_state = state_tracker.get(flight_session_id)
+    if current_state is not None:
+        # Stamp exit intent onto the session's live state so the eventual
+        # finalization payload can emit an EXIT_REQUEST event.  Only set
+        # once — a retried exit shouldn't overwrite the original intent.
+        if current_state.exit_requested_at is None:
+            current_state.exit_requested_at = requested_at
+            current_state.exit_reason = reason
 
     LOGGER.info(
         "Exit request accepted — starting grace period. "

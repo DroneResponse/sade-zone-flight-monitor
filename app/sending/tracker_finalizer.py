@@ -58,39 +58,81 @@ def get_tracker_finalized_url() -> str:
     return url
 
 
+def _build_battery_state(voltage: float | None) -> dict[str, Any]:
+    """Build one ``battery_state_in`` / ``battery_state_out`` object.
+
+    The schema carries a ``system_charge_pct`` plus a ``slots`` array of
+    ``{slot_id, voltage_v}`` entries.  Current telemetry is voltage-only and
+    single-slot, so this wraps one slot "A".  When firmware starts emitting
+    per-slot voltages the single point of change is this helper.
+    """
+    # TODO: switch system_charge_pct to null once SADE confirms it's nullable,
+    # or populate it for real once firmware emits a battery-percentage field.
+    return {
+        "system_charge_pct": 0.0,
+        "slots": [
+            {
+                "slot_id": "A",
+                "voltage_v": float(voltage) if voltage is not None else 0.0,
+            },
+        ],
+    }
+
+
 def build_finalization_payload(state: DroneState) -> dict[str, Any]:
     """Build the POST body for ``/tracker-session-finalized`` from mission state.
 
-    All fields are derived from the telemetry that the pipeline has accumulated
-    in DroneState over the course of the mission.
-
-    Field sources:
-    - ``flight_session_id``     → state.flight_session_id (from SADE approval or synthetic local ID)
-    - ``report_time``           → wall-clock UTC at the moment this report is sent
-    - ``actual_start_time``     → state.first_seen (timestamp of the first received message)
-    - ``actual_end_time``       → state.last_seen  (timestamp of the terminal status message)
-    - ``altitude_min_m``        → state.min_altitude (running min accumulated from status.location.altitude)
-    - ``altitude_max_m``        → state.max_altitude (running max accumulated from status.location.altitude)
-    - ``battery_voltage_start_v`` → state.voltage_in  (voltage from the first message that carried it)
-    - ``battery_voltage_end_v``   → state.voltage_out (voltage from the terminal message)
-    - ``battery_start_pct``     → not in the telemetry schema; the drone sim and live payload both
-                                   publish only voltage, not percentage. Sent as 0.0 until a
-                                   percentage field is added to the telemetry payload.
-    - ``battery_end_pct``       → same as above.
+    Shape per SADE_AWS_API_INFORMATION/SADE_CONTRACT.md (2026-04-22):
+      - top-level: flight_session_id, report_time_utc, telemetry_summary, events
+      - telemetry_summary carries only altitude_{min,max}_m + distance_flown_m
+      - flown window is derived by SADE from the FLIGHT_SEGMENT events, not
+        from top-level fields (those no longer exist)
+      - battery state moves into each FLIGHT_SEGMENT as battery_state_{in,out}
+      - EXIT_REQUEST appears in events when the operator asked to leave early
+      - INCIDENT events are not emitted yet (blocked on incident-code mapping)
     """
+    # ── FLIGHT-SEGMENT EMISSION ──────────────────────────────────────────
+    # Today: one synthetic FLIGHT_SEGMENT spanning first_seen→last_seen.
+    # When arm-state detection lands, replace this block with:
+    #
+    #     events: list[dict[str, Any]] = [
+    #         {
+    #             "type": "FLIGHT_SEGMENT",
+    #             "time_in_utc": _to_utc_z(seg.time_in_utc),
+    #             "time_out_utc": _to_utc_z(seg.time_out_utc),
+    #             "battery_state_in": _build_battery_state(seg.voltage_in),
+    #             "battery_state_out": _build_battery_state(seg.voltage_out),
+    #         }
+    #         for seg in state.segments
+    #     ]
+    #
+    # Any segment still open at finalize time must be closed by the caller
+    # (close at last_seen, tag closed_by="finalize") before this runs.
+    segment: dict[str, Any] = {
+        "type": "FLIGHT_SEGMENT",
+        "time_in_utc": _to_utc_z(state.first_seen),
+        "time_out_utc": _to_utc_z(state.last_seen),
+        "battery_state_in": _build_battery_state(state.voltage_in),
+        "battery_state_out": _build_battery_state(state.voltage_out),
+    }
+    events: list[dict[str, Any]] = [segment]
+
+    if state.exit_requested_at is not None:
+        events.append({
+            "type": "EXIT_REQUEST",
+            "time_utc": _to_utc_z(state.exit_requested_at),
+            "reason": state.exit_reason or "unspecified",
+        })
+
     return {
         "flight_session_id": state.flight_session_id,
-        "report_time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "actual_start_time": _to_utc_z(state.first_seen),
-        "actual_end_time": _to_utc_z(state.last_seen),
+        "report_time_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "telemetry_summary": {
             "altitude_min_m": float(state.min_altitude) if state.min_altitude is not None else 0.0,
             "altitude_max_m": float(state.max_altitude) if state.max_altitude is not None else 0.0,
-            "battery_start_pct": 0.0,  # voltage-only telemetry; no percentage field available
-            "battery_end_pct": 0.0,    # voltage-only telemetry; no percentage field available
-            "battery_voltage_start_v": float(state.voltage_in) if state.voltage_in is not None else 0.0,
-            "battery_voltage_end_v": float(state.voltage_out) if state.voltage_out is not None else 0.0,
+            "distance_flown_m": float(state.distance_flown_m),
         },
+        "events": events,
     }
 
 
@@ -100,31 +142,43 @@ def build_stub_finalization_payload(
 ) -> dict[str, Any]:
     """Build the POST body for ``/tracker-session-finalized`` from test overrides.
 
-    Used when ``test_overrides`` is present on a registered session.  The
-    override dict is expected to carry ``actual_start_time``,
-    ``actual_end_time``, and an optional ``telemetry_summary`` — matching
-    the shape documented in FLIGHT_MONITOR_CONTRACT.md.
+    Used when ``test_overrides`` is present on a registered session.  Override
+    shape matches the new SADE contract (see SADE_CONTRACT.md §test_overrides):
 
-    Missing fields are filled with safe defaults so the payload always
-    satisfies the SADE API contract.
+        {
+          "telemetry_summary": {altitude_max_m, distance_flown_m, ...},
+          "events": [ {type: FLIGHT_SEGMENT, time_in_utc, time_out_utc, ...}, ... ]
+        }
+
+    Missing pieces get safe defaults so the stub payload still satisfies the
+    contract.  If overrides carry no events, synthesize one FLIGHT_SEGMENT
+    anchored at "now" so SADE can derive a window.
     """
     telemetry = test_overrides.get("telemetry_summary") or {}
+    override_events = test_overrides.get("events")
+
+    now_z = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    if override_events:
+        events = [dict(event) for event in override_events]
+    else:
+        events = [{
+            "type": "FLIGHT_SEGMENT",
+            "time_in_utc": now_z,
+            "time_out_utc": now_z,
+            "battery_state_in": _build_battery_state(None),
+            "battery_state_out": _build_battery_state(None),
+        }]
 
     return {
         "flight_session_id": flight_session_id,
-        "report_time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "actual_start_time": test_overrides.get("actual_start_time")
-            or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "actual_end_time": test_overrides.get("actual_end_time")
-            or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "report_time_utc": now_z,
         "telemetry_summary": {
             "altitude_min_m": float(telemetry.get("altitude_min_m", 0.0)),
             "altitude_max_m": float(telemetry.get("altitude_max_m", 0.0)),
-            "battery_start_pct": float(telemetry.get("battery_start_pct", 0.0)),
-            "battery_end_pct": float(telemetry.get("battery_end_pct", 0.0)),
-            "battery_voltage_start_v": float(telemetry.get("battery_voltage_start_v", 0.0)),
-            "battery_voltage_end_v": float(telemetry.get("battery_voltage_end_v", 0.0)),
+            "distance_flown_m": float(telemetry.get("distance_flown_m", 0.0)),
         },
+        "events": events,
     }
 
 
@@ -150,11 +204,17 @@ async def post_tracker_session_finalized(payload: dict[str, Any]) -> dict[str, A
     flight_session_id = payload.get("flight_session_id")
     tracker_url = get_tracker_finalized_url()
 
+    # Pull the flown window out of the first FLIGHT_SEGMENT for the log line —
+    # SADE derives the same window from events, so this is the right source.
+    first_segment = next(
+        (ev for ev in payload.get("events", []) if ev.get("type") == "FLIGHT_SEGMENT"),
+        None,
+    )
     LOGGER.info(
         "Sending tracker finalization POST for flight_session_id=%s actual_start=%s actual_end=%s",
         flight_session_id,
-        payload.get("actual_start_time"),
-        payload.get("actual_end_time"),
+        (first_segment or {}).get("time_in_utc"),
+        (first_segment or {}).get("time_out_utc"),
     )
 
     last_error: Exception | None = None

@@ -28,7 +28,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 
 from app.monitoring.active_session_registry import ActiveSessionRegistry
-from app.monitoring.state_tracker import DroneStateTracker
+from app.monitoring.state_tracker import DroneState, DroneStateTracker
 from app.api.approval_handler import (
     RegisterSessionPayload,
     process_register_session,
@@ -278,25 +278,30 @@ async def _run_exit_grace_period(
     captured_state = tracker.pop(flight_session_id)
     session = reg.complete(flight_session_id)
 
+    # ── FLIGHT-SEGMENT CLOSE HOOK ────────────────────────────────────────
+    # When arm-state-based segment detection is in place, any segment still
+    # open on captured_state must be closed here before the payload is
+    # built — close at captured_state.last_seen and tag closed_by="finalize".
+    # Same hook applies at the worker-side terminal-message finalize path
+    # (the "mission_completed" branch that also calls build_finalization_payload).
     if captured_state is not None:
         payload = build_finalization_payload(captured_state)
     else:
-        now_z = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        # No telemetry was ever observed for this session.  Build a minimal
+        # contract-valid finalization by running a synthetic DroneState
+        # through the normal payload builder — same code path, one shape.
+        now_iso = datetime.now(timezone.utc).isoformat()
         entry_time = session.requested_entry_time if session else None
-        payload = {
-            "flight_session_id": flight_session_id,
-            "report_time": now_z,
-            "actual_start_time": entry_time or now_z,
-            "actual_end_time": now_z,
-            "telemetry_summary": {
-                "altitude_min_m": 0.0,
-                "altitude_max_m": 0.0,
-                "battery_start_pct": 0.0,
-                "battery_end_pct": 0.0,
-                "battery_voltage_start_v": 0.0,
-                "battery_voltage_end_v": 0.0,
-            },
-        }
+        synthetic_state = DroneState(
+            flight_session_id=flight_session_id,
+            drone_id=drone_id,
+            session_source=session.session_source if session else "aws",
+            first_seen=entry_time or now_iso,
+            last_seen=now_iso,
+            latest_raw_message={},
+            latest_parsed_payload={},
+        )
+        payload = build_finalization_payload(synthetic_state)
 
     await post_tracker_session_finalized(payload)
 

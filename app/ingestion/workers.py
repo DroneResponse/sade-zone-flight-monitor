@@ -236,6 +236,13 @@ async def telemetry_worker(
 
                 # API finalization — POST to SADE when running in non-local mode.
                 # Enabled via --finalize-to-api; CSV and API paths are independent.
+                #
+                # FLIGHT-SEGMENT CLOSE HOOK: when arm-state-based segment
+                # detection is in place, any segment still open on `state`
+                # must be closed here before build_finalization_payload runs
+                # — close at state.last_seen, tag closed_by="finalize".
+                # Same hook exists in the exit-grace-period finalize path in
+                # app/api/server.py; keep them in lockstep.
                 if finalize_to_api:
                     fin_payload = build_finalization_payload(state)
                     await post_tracker_session_finalized(fin_payload)

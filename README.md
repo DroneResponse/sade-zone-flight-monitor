@@ -2,11 +2,14 @@
 
 This service is the **flight monitor / telemetry tracker** component of the SADE system. It sits between an MQTT broker and the SADE AWS backend:
 
-- It receives live telemetry from active drones over MQTT
-- It tracks mission state per drone in memory (altitude, battery, position, message count)
-- When a mission completes (either via terminal MQTT status or via an exit request from SADE), it sends a finalization report to the SADE AWS API (`POST /tracker-session-finalized`), which closes the approved session and records the reputation entry
+- It receives live telemetry from active drones over MQTT (AWS IoT Core via mTLS in production)
+- It tracks mission state per drone in memory (altitude min/max, battery voltage, position, distance flown, message count)
+- When a mission completes (terminal MQTT status today; SADE exit-request under the planned new exit policy — see [docs/EXIT_POLICY_DESIGN.md](docs/EXIT_POLICY_DESIGN.md)), it sends a finalization report to the SADE AWS API (`POST /tracker-session-finalized`), which closes the approved session and records the reputation entry
 
-The service does **not** make entry decisions. That is SADE's job. This service only watches flights that SADE has already approved, records what actually happened, and reports back when they land.
+The finalization payload follows the schema in [SADE_AWS_API_INFORMATION/SADE_CONTRACT.md](SADE_AWS_API_INFORMATION/SADE_CONTRACT.md): top-level `telemetry_summary` (altitude min/max + `distance_flown_m`) plus an `events` array of `FLIGHT_SEGMENT` / `EXIT_REQUEST` / `INCIDENT` entries. Per-segment battery state carries `system_charge_pct` plus a `slots[]` array of `{slot_id, voltage_v}` to support multi-slot drones.
+
+The service does **not** make entry decisions. That is SADE's job. This service only watches flights that SADE has already approved, records what actually happened, and reports back what is monitored.
+
 
 ---
 
@@ -38,7 +41,8 @@ Telemetry Worker(s)                 ← one or more async worker tasks
     ├── update DroneStateTracker (altitude min/max, voltage, position, count)
     │
     └── on terminal status (mission_completed / complete / done / ...)
-        OR exit-request grace period elapses:
+        OR exit-request grace period elapses (5 min telemetry silence)
+        OR test_overrides stub timer (5 s):
             │
             ├── write CSV row (if --out is set)
             │
@@ -49,17 +53,31 @@ Telemetry Worker(s)                 ← one or more async worker tasks
                 SADE AWS API  →  closes session, writes reputation record
 ```
 
+> **Planned change:** Under the new exit policy in [docs/EXIT_POLICY_DESIGN.md](docs/EXIT_POLICY_DESIGN.md), terminal MQTT status will no longer trigger the SADE finalize POST — only the SADE exit-request (B1), stub mode (B2), or a 24 h deadline-breach backstop (B3) will. The CSV row on terminal MQTT is retained for local testing.
+
 ### Key state accumulated per drone
 
-Each active drone session tracks:
+Each active drone session tracks (see `DroneState` in [app/monitoring/state_tracker.py](app/monitoring/state_tracker.py)):
+
 - `first_seen` / `last_seen` — wall-clock timestamps of first and last message
 - `min_altitude` / `max_altitude` — running min/max from `status.location.altitude`
 - `voltage_in` / `voltage_out` — battery voltage from first and most recent message
+- `distance_flown_m` — great-circle distance accumulated across GPS fixes (haversine)
 - `start_position` / `position` — GPS coordinates at takeoff and current
 - `message_count` — total messages processed
-- `mission_status` — latest reported status string
+- `mission_status` / `mode` — latest reported status and mode strings
+- `exit_requested_at` / `exit_reason` — stamped on the first SADE exit-request; feeds the `EXIT_REQUEST` event in the finalization payload
 
-Finalization fires exactly once per session when a terminal status arrives. The state is then removed from memory.
+Finalization fires exactly once per session. Today there are four trigger cases:
+
+| Case | Trigger |
+|---|---|
+| A1 | Terminal MQTT status (`mission_completed` / `complete` / `done` / ...) |
+| A2 | Exit-request received + 5 min telemetry silence |
+| A3 | Same as A2 but no telemetry was ever received (synthetic payload) |
+| A4 | `test_overrides` stub mode — fires 5 s after registration |
+
+State is removed from memory after the POST. A fifth case (B3 — 24 h deadline-breach auto-finalize) is planned; see [docs/EXIT_POLICY_DESIGN.md](docs/EXIT_POLICY_DESIGN.md).
 
 ---
 
@@ -354,7 +372,14 @@ sade/
 │   └── local_testing_run_guide.txt # Notes on running local tests manually
 │
 ├── scripts/
+│   ├── run_flight_monitor.sh       # Env-file launcher with pre-flight config validation
+│   ├── run_e2e_aws_test.py         # End-to-end test against real AWS IoT Core + SADE
+│   ├── run_stress_test.py          # Stress harness (configurable drone count / queue depth)
+│   ├── run_stress_test_sweep.py    # Parameter sweep across stress configurations
 │   └── run_worker_comparison.py    # Benchmarks 1/2/4 worker configurations
+│
+├── docs/
+│   └── EXIT_POLICY_DESIGN.md       # Data-flow map and planned new exit-policy design
 │
 ├── missions/
 │   ├── sample_mission.json         # Example mission waypoint data
@@ -376,6 +401,8 @@ sade/
     ├── OPERATOR_LIFECYCLE.md
     ├── API_REFERENCE.md
     ├── FLIGHT_MONITOR_CONTRACT.md
+    ├── SADE_CONTRACT.md            # Current finalization-payload schema (2026-04-22)
+    ├── REFERENCE_TABLES.md         # Event types, incident codes, payload-component types
     ├── EXIT_REQUEST_GUIDE.md
     └── IDEMPOTENCY_RECOMMENDATIONS.md
 ```
@@ -408,8 +435,8 @@ Mission completion is detected by matching `mission_status` against a set of kno
 **Bounded retry on finalization POST**
 `post_tracker_session_finalized()` retries up to 2 times with `[1s, 2s]` exponential backoff. 5xx responses and network/transport errors are retried; 4xx responses are not (the payload is invalid — retrying won't change the outcome). SADE deduplicates on `flight_session_id`, so retrying is safe. Business-level `FAILED` responses are logged but not retried.
 
-**Two finalization trigger paths share one payload shape**
-Both the normal terminal-MQTT-status path and the exit-request grace-period path produce payloads via `build_finalization_payload()` from the accumulated `DroneState`. The `test_overrides` stub path uses `build_stub_finalization_payload()` to synthesize an equivalent-shaped payload from the override dict. This keeps the SADE-facing contract identical regardless of how the session finalizes.
+**All finalization paths share one payload shape**
+All four trigger cases (terminal MQTT, exit-request grace period with telemetry, exit-request grace period without telemetry, and `test_overrides` stub) converge on the same payload shape defined in [SADE_AWS_API_INFORMATION/SADE_CONTRACT.md](SADE_AWS_API_INFORMATION/SADE_CONTRACT.md): top-level `telemetry_summary` plus an `events` array. `build_finalization_payload()` builds from an accumulated `DroneState`; `build_stub_finalization_payload()` builds from the `test_overrides` dict. The no-telemetry grace-period case runs a synthetic `DroneState` through `build_finalization_payload()` rather than assembling the payload inline, so there is exactly one code path that produces the contract shape.
 
 **Exit grace period keeps the session live**
 On `exit-request`, the session is NOT removed up front — it stays in the registry so MQTT telemetry continues to be accepted and accumulated during the grace period. A background task polls every 30s and only finalizes after 5 minutes of continuous silence. This ensures we capture the drone's final telemetry as it leaves the zone rather than cutting off mid-flight.
@@ -421,8 +448,8 @@ On `exit-request`, the session is NOT removed up front — it stays in the regis
 **Authentication on the webhook endpoints**
 `/flight-monitor/register-session` and `/flight-monitor/exit-request` have no auth. Any caller that can reach the port can register or close out a session. For production, this needs at minimum a shared secret header check, ideally mTLS or IAM-signed requests depending on the deployment environment.
 
-**Battery percentage fields**
-`battery_start_pct` and `battery_end_pct` are sent as `0.0` in every finalization report built from real telemetry. The current telemetry payload only carries voltage, not percentage. Either the drone firmware needs to add a percentage field, or the service needs a voltage-to-percentage conversion curve per battery type.
+**Battery `system_charge_pct` and multi-slot voltages**
+Per-segment `battery_state_in` / `battery_state_out` currently emit `system_charge_pct: 0.0` and wrap the single telemetry voltage as `slots: [{slot_id: "A", voltage_v: <v>}]`. Two firmware-side gaps block real data here: (1) telemetry does not yet carry a battery percentage field — either firmware adds one or the service needs a voltage-to-percentage curve per battery type; (2) multi-slot drones do not yet emit per-slot voltages, so `slots` is always a single-entry array today. The builder in `app/sending/tracker_finalizer.py` has a single `_build_battery_state()` helper — that is the one-line change point when either gap closes. It is also worth confirming with SADE whether `system_charge_pct: null` is acceptable; if so, the `0.0` placeholder flips to `null` until real data is available.
 
 **CSV output is not production output**
 The CSV writer was built for local observation and debugging. The finalization API call (`--finalize-to-api`) is the production path. The CSV should be treated as a diagnostic tool, not a record of truth.
@@ -436,5 +463,11 @@ A `Dockerfile` exists and the image builds and runs. A `docker-compose.yml` that
 **Mission-plan integration**
 `app/missions/` is a placeholder. The drone simulator uses static waypoint JSON files but the production service has no awareness of planned vs. actual flight paths. Distance flown, route deviation, and waypoint compliance are not computed.
 
-**Idle drone cleanup**
-If a drone registers a session and then goes silent without ever sending a terminal status or exit request (e.g., crash, lost comms), its state lives in memory indefinitely. There is no TTL or watchdog that cleans up stale in-flight sessions outside the exit-request path.
+**Exit-policy redesign (planned)**
+The current system has two known gaps around session exit: (1) the drone can close its own session via terminal MQTT status, even though SADE is the system of record for session state, and (2) a session that never receives a terminal MQTT message and never receives a SADE exit-request will leak in memory until process restart. The planned redesign moves finalization authority exclusively to SADE (via the exit-request webhook), uses a periodic sweeper to flag sessions that pass `requested_exit_time_utc` without an exit-request, and adds a 24 h post-deadline auto-finalize as a memory-safety backstop. Full plan, data-flow comparison, and rollout notes in [docs/EXIT_POLICY_DESIGN.md](docs/EXIT_POLICY_DESIGN.md).
+
+**Incident detection**
+`INCIDENT` events are defined in [SADE_AWS_API_INFORMATION/REFERENCE_TABLES.md](SADE_AWS_API_INFORMATION/REFERENCE_TABLES.md) with a standard `hhhh-sss` code format, but the Flight Monitor does not yet emit any. Detection of the relevant incident categories (airspace violation, loss-of-control, battery failure, etc.) requires a signal-to-code mapping that is not yet specified.
+
+**Multi-segment `FLIGHT_SEGMENT` detection**
+Today a session emits exactly one `FLIGHT_SEGMENT` spanning `first_seen`→`last_seen`. Multi-segment detection (drone arms, flies, lands, arms again) requires firmware to emit an arm-state field (proposed: `status.flight_state ∈ {"ARMED", "DISARMED"}`). Hook points for this are marked with comments in [app/monitoring/state_tracker.py](app/monitoring/state_tracker.py), [app/sending/tracker_finalizer.py](app/sending/tracker_finalizer.py), [app/api/server.py](app/api/server.py), and [app/ingestion/workers.py](app/ingestion/workers.py).

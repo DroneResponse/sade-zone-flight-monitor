@@ -44,6 +44,19 @@ class DroneState:
     distance_flown_m: float = 0.0
     message_count: int = 0
     row_written: bool = False
+    exit_requested_at: str | None = None
+    exit_reason: str | None = None
+
+    # FLIGHT-SEGMENT DETECTION (not yet implemented — pending firmware emitting
+    # an arm-state field).  When it lands, add here:
+    #
+    #     segments: list[FlightSegment] = field(default_factory=list)
+    #
+    # where FlightSegment captures {time_in_utc, time_out_utc, voltage_in,
+    # voltage_out, min_altitude, max_altitude, opened_by, closed_by}.
+    # Per-segment altitude/voltage accumulators move off DroneState and onto
+    # the currently-open segment.  distance_flown_m stays session-level —
+    # SADE's telemetry_summary.distance_flown_m is one value, not per-segment.
 
 
 class DroneStateTracker:
@@ -69,6 +82,22 @@ class DroneStateTracker:
         observed_at = last_seen or datetime.now(timezone.utc).isoformat()
         current_altitude = _safe_float((position or {}).get("altitude"))
         current_voltage = _extract_voltage(parsed_payload)
+
+        # ── FLIGHT-SEGMENT DETECTION HOOK (primary signal) ───────────────────
+        # When firmware starts emitting an arm-state field (proposed:
+        # parsed_payload["status"]["flight_state"] ∈ {"ARMED", "DISARMED"}),
+        # read it here before routing altitude/voltage below:
+        #
+        #   flight_state = (parsed_payload.get("status") or {}).get("flight_state")
+        #   # ARMED with no open segment → open one at observed_at.
+        #   # DISARMED with an open segment → close it at observed_at
+        #   #   (tag closed_by="DISARMED").
+        #   # Absent field → legacy behavior (one segment spanning the session).
+        #
+        # Once the open segment is identified, altitude/voltage accumulators
+        # below should write into segment.{min,max}_altitude and
+        # segment.voltage_{in,out} instead of the top-level DroneState fields.
+        # distance_flown_m stays session-level.
 
         existing = self._states.get(flight_session_id)
         if existing is None:

@@ -30,6 +30,9 @@ def _make_drone_state(
     max_altitude: float | None = 92.0,
     voltage_in: float | None = 16.4,
     voltage_out: float | None = 14.9,
+    distance_flown_m: float = 1250.0,
+    exit_requested_at: str | None = None,
+    exit_reason: str | None = None,
 ) -> DroneState:
     return DroneState(
         flight_session_id=flight_session_id,
@@ -43,12 +46,19 @@ def _make_drone_state(
         max_altitude=max_altitude,
         voltage_in=voltage_in,
         voltage_out=voltage_out,
+        distance_flown_m=distance_flown_m,
         message_count=10,
+        exit_requested_at=exit_requested_at,
+        exit_reason=exit_reason,
     )
 
 
 def _utc_now_z() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _first_flight_segment(payload: dict) -> dict:
+    return next(ev for ev in payload["events"] if ev["type"] == "FLIGHT_SEGMENT")
 
 
 # ── get_tracker_finalized_url() ──────────────────────────────────────────────
@@ -74,39 +84,34 @@ class TestGetTrackerFinalizedUrl:
 
 
 class TestBuildFinalizationPayload:
-    def test_basic_payload_structure(self):
+    def test_top_level_structure(self):
         state = _make_drone_state()
         payload = build_finalization_payload(state)
 
-        assert "flight_session_id" in payload
-        assert "report_time" in payload
-        assert "actual_start_time" in payload
-        assert "actual_end_time" in payload
-        assert "telemetry_summary" in payload
+        assert set(payload.keys()) == {
+            "flight_session_id",
+            "report_time_utc",
+            "telemetry_summary",
+            "events",
+        }
 
-        summary = payload["telemetry_summary"]
-        for key in (
-            "altitude_min_m", "altitude_max_m",
-            "battery_start_pct", "battery_end_pct",
-            "battery_voltage_start_v", "battery_voltage_end_v",
-        ):
-            assert key in summary
+    def test_telemetry_summary_has_only_allowed_keys(self):
+        state = _make_drone_state()
+        payload = build_finalization_payload(state)
+
+        # Per SADE_CONTRACT.md, telemetry_summary is limited to these three.
+        # Guard against regressions that would add battery_* back at the top.
+        assert set(payload["telemetry_summary"].keys()) == {
+            "altitude_min_m",
+            "altitude_max_m",
+            "distance_flown_m",
+        }
 
     def test_flight_session_id_from_state(self):
         state = _make_drone_state(flight_session_id="flight-xyz")
         payload = build_finalization_payload(state)
 
         assert payload["flight_session_id"] == "flight-xyz"
-
-    def test_times_normalized_to_utc_z(self):
-        state = _make_drone_state(
-            first_seen="2026-03-09T18:00:00+00:00",
-            last_seen="2026-03-09T19:03:00+00:00",
-        )
-        payload = build_finalization_payload(state)
-
-        assert payload["actual_start_time"] == "2026-03-09T18:00:00Z"
-        assert payload["actual_end_time"] == "2026-03-09T19:03:00Z"
 
     def test_altitude_from_state(self):
         state = _make_drone_state(min_altitude=12.0, max_altitude=94.5)
@@ -122,81 +127,122 @@ class TestBuildFinalizationPayload:
         assert payload["telemetry_summary"]["altitude_min_m"] == 0.0
         assert payload["telemetry_summary"]["altitude_max_m"] == 0.0
 
-    def test_voltage_from_state(self):
-        state = _make_drone_state(voltage_in=16.2, voltage_out=14.9)
+    def test_distance_flown_from_state(self):
+        state = _make_drone_state(distance_flown_m=1250.5)
         payload = build_finalization_payload(state)
 
-        assert payload["telemetry_summary"]["battery_voltage_start_v"] == 16.2
-        assert payload["telemetry_summary"]["battery_voltage_end_v"] == 14.9
+        assert payload["telemetry_summary"]["distance_flown_m"] == 1250.5
 
-    def test_voltage_none_defaults_to_zero(self):
-        state = _make_drone_state(voltage_in=None, voltage_out=None)
-        payload = build_finalization_payload(state)
-
-        assert payload["telemetry_summary"]["battery_voltage_start_v"] == 0.0
-        assert payload["telemetry_summary"]["battery_voltage_end_v"] == 0.0
-
-    def test_battery_pct_always_zero(self):
-        state = _make_drone_state()
-        payload = build_finalization_payload(state)
-
-        assert payload["telemetry_summary"]["battery_start_pct"] == 0.0
-        assert payload["telemetry_summary"]["battery_end_pct"] == 0.0
-
-    def test_report_time_is_current_utc(self):
+    def test_report_time_utc_is_current_utc(self):
         before = _utc_now_z()
         state = _make_drone_state()
         payload = build_finalization_payload(state)
         after = _utc_now_z()
 
-        assert before <= payload["report_time"] <= after
+        assert before <= payload["report_time_utc"] <= after
+
+
+class TestFlightSegmentEvent:
+    def test_single_segment_emitted(self):
+        state = _make_drone_state()
+        payload = build_finalization_payload(state)
+
+        segments = [ev for ev in payload["events"] if ev["type"] == "FLIGHT_SEGMENT"]
+        assert len(segments) == 1
+
+    def test_segment_times_normalized_to_utc_z(self):
+        state = _make_drone_state(
+            first_seen="2026-03-09T18:00:00+00:00",
+            last_seen="2026-03-09T19:03:00+00:00",
+        )
+        segment = _first_flight_segment(build_finalization_payload(state))
+
+        assert segment["time_in_utc"] == "2026-03-09T18:00:00Z"
+        assert segment["time_out_utc"] == "2026-03-09T19:03:00Z"
+
+    def test_battery_state_wraps_single_slot_a(self):
+        state = _make_drone_state(voltage_in=24.8, voltage_out=23.9)
+        segment = _first_flight_segment(build_finalization_payload(state))
+
+        assert segment["battery_state_in"]["slots"] == [{"slot_id": "A", "voltage_v": 24.8}]
+        assert segment["battery_state_out"]["slots"] == [{"slot_id": "A", "voltage_v": 23.9}]
+
+    def test_battery_state_voltage_none_defaults_to_zero(self):
+        state = _make_drone_state(voltage_in=None, voltage_out=None)
+        segment = _first_flight_segment(build_finalization_payload(state))
+
+        assert segment["battery_state_in"]["slots"][0]["voltage_v"] == 0.0
+        assert segment["battery_state_out"]["slots"][0]["voltage_v"] == 0.0
+
+    def test_system_charge_pct_is_zero_placeholder(self):
+        # Known gap: telemetry carries voltage only.  Change to null (or real
+        # value) once firmware emits a battery-percentage field.
+        state = _make_drone_state()
+        segment = _first_flight_segment(build_finalization_payload(state))
+
+        assert segment["battery_state_in"]["system_charge_pct"] == 0.0
+        assert segment["battery_state_out"]["system_charge_pct"] == 0.0
+
+
+class TestExitRequestEvent:
+    def test_no_exit_requested_yields_no_exit_event(self):
+        state = _make_drone_state()
+        payload = build_finalization_payload(state)
+
+        exit_events = [ev for ev in payload["events"] if ev["type"] == "EXIT_REQUEST"]
+        assert exit_events == []
+
+    def test_exit_requested_yields_one_exit_event(self):
+        state = _make_drone_state(
+            exit_requested_at="2026-03-09T18:35:00+00:00",
+            exit_reason="Returning home early",
+        )
+        payload = build_finalization_payload(state)
+
+        exit_events = [ev for ev in payload["events"] if ev["type"] == "EXIT_REQUEST"]
+        assert len(exit_events) == 1
+        assert exit_events[0] == {
+            "type": "EXIT_REQUEST",
+            "time_utc": "2026-03-09T18:35:00Z",
+            "reason": "Returning home early",
+        }
+
+    def test_exit_event_reason_defaults_to_unspecified(self):
+        state = _make_drone_state(
+            exit_requested_at="2026-03-09T18:35:00+00:00",
+            exit_reason=None,
+        )
+        payload = build_finalization_payload(state)
+
+        exit_events = [ev for ev in payload["events"] if ev["type"] == "EXIT_REQUEST"]
+        assert exit_events[0]["reason"] == "unspecified"
 
 
 # ── build_stub_finalization_payload() ────────────────────────────────────────
 
 
 class TestBuildStubFinalizationPayload:
-    def test_basic_stub_structure(self):
-        overrides = {
-            "actual_start_time": "2026-01-01T18:05:00Z",
-            "actual_end_time": "2026-01-01T18:41:00Z",
-            "telemetry_summary": {
-                "altitude_min_m": 12.0,
-                "altitude_max_m": 88.0,
-                "battery_start_pct": 98.0,
-                "battery_end_pct": 61.0,
-            },
-        }
-        payload = build_stub_finalization_payload("flight-stub", overrides)
+    def test_top_level_structure(self):
+        payload = build_stub_finalization_payload("flight-stub", {})
 
-        assert "flight_session_id" in payload
-        assert "report_time" in payload
-        assert "actual_start_time" in payload
-        assert "actual_end_time" in payload
-        assert "telemetry_summary" in payload
+        assert set(payload.keys()) == {
+            "flight_session_id",
+            "report_time_utc",
+            "telemetry_summary",
+            "events",
+        }
 
     def test_flight_session_id_passed_through(self):
         payload = build_stub_finalization_payload("my-flight-id", {})
 
         assert payload["flight_session_id"] == "my-flight-id"
 
-    def test_times_from_overrides(self):
-        overrides = {
-            "actual_start_time": "2026-04-21T18:05:00Z",
-            "actual_end_time": "2026-04-21T18:41:00Z",
-        }
-        payload = build_stub_finalization_payload("f1", overrides)
-
-        assert payload["actual_start_time"] == "2026-04-21T18:05:00Z"
-        assert payload["actual_end_time"] == "2026-04-21T18:41:00Z"
-
     def test_telemetry_values_from_overrides(self):
         overrides = {
             "telemetry_summary": {
                 "altitude_min_m": 10.0,
                 "altitude_max_m": 90.0,
-                "battery_start_pct": 97.0,
-                "battery_end_pct": 58.0,
+                "distance_flown_m": 1500.0,
             },
         }
         payload = build_stub_finalization_payload("f1", overrides)
@@ -204,16 +250,16 @@ class TestBuildStubFinalizationPayload:
 
         assert summary["altitude_min_m"] == 10.0
         assert summary["altitude_max_m"] == 90.0
-        assert summary["battery_start_pct"] == 97.0
-        assert summary["battery_end_pct"] == 58.0
+        assert summary["distance_flown_m"] == 1500.0
 
-    def test_missing_times_default_to_utc_now(self):
-        before = _utc_now_z()
+    def test_telemetry_summary_limited_to_three_keys(self):
         payload = build_stub_finalization_payload("f1", {})
-        after = _utc_now_z()
 
-        assert before <= payload["actual_start_time"] <= after
-        assert before <= payload["actual_end_time"] <= after
+        assert set(payload["telemetry_summary"].keys()) == {
+            "altitude_min_m",
+            "altitude_max_m",
+            "distance_flown_m",
+        }
 
     def test_missing_telemetry_summary_defaults_to_zeros(self):
         payload = build_stub_finalization_payload("f1", {})
@@ -221,38 +267,43 @@ class TestBuildStubFinalizationPayload:
 
         assert summary["altitude_min_m"] == 0.0
         assert summary["altitude_max_m"] == 0.0
-        assert summary["battery_start_pct"] == 0.0
-        assert summary["battery_end_pct"] == 0.0
-        assert summary["battery_voltage_start_v"] == 0.0
-        assert summary["battery_voltage_end_v"] == 0.0
+        assert summary["distance_flown_m"] == 0.0
 
-    def test_partial_telemetry_summary(self):
+    def test_events_passed_through_from_overrides(self):
         overrides = {
-            "telemetry_summary": {
-                "altitude_max_m": 75.0,
-            },
+            "events": [
+                {
+                    "type": "FLIGHT_SEGMENT",
+                    "time_in_utc": "2026-03-09T18:05:00Z",
+                    "time_out_utc": "2026-03-09T18:41:00Z",
+                },
+            ],
         }
         payload = build_stub_finalization_payload("f1", overrides)
-        summary = payload["telemetry_summary"]
 
-        assert summary["altitude_max_m"] == 75.0
-        # Everything else defaults to 0.0
-        assert summary["altitude_min_m"] == 0.0
-        assert summary["battery_start_pct"] == 0.0
-        assert summary["battery_voltage_start_v"] == 0.0
+        assert len(payload["events"]) == 1
+        assert payload["events"][0]["time_in_utc"] == "2026-03-09T18:05:00Z"
+        assert payload["events"][0]["time_out_utc"] == "2026-03-09T18:41:00Z"
 
-    def test_voltage_from_overrides(self):
-        overrides = {
-            "telemetry_summary": {
-                "battery_voltage_start_v": 16.2,
-                "battery_voltage_end_v": 14.9,
-            },
-        }
-        payload = build_stub_finalization_payload("f1", overrides)
-        summary = payload["telemetry_summary"]
+    def test_missing_events_synthesizes_single_flight_segment(self):
+        before = _utc_now_z()
+        payload = build_stub_finalization_payload("f1", {})
+        after = _utc_now_z()
 
-        assert summary["battery_voltage_start_v"] == 16.2
-        assert summary["battery_voltage_end_v"] == 14.9
+        assert len(payload["events"]) == 1
+        segment = payload["events"][0]
+        assert segment["type"] == "FLIGHT_SEGMENT"
+        assert before <= segment["time_in_utc"] <= after
+        assert before <= segment["time_out_utc"] <= after
+        assert segment["battery_state_in"]["slots"][0]["slot_id"] == "A"
+        assert segment["battery_state_out"]["slots"][0]["slot_id"] == "A"
+
+    def test_report_time_utc_is_current_utc(self):
+        before = _utc_now_z()
+        payload = build_stub_finalization_payload("f1", {})
+        after = _utc_now_z()
+
+        assert before <= payload["report_time_utc"] <= after
 
 
 # ── _to_utc_z() ─────────────────────────────────────────────────────────────

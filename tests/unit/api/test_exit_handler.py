@@ -144,6 +144,79 @@ class TestExitAccepted:
         assert result["drone_id"] == "drone-from-session"
 
 
+# ── process_exit_request(): exit intent stamped onto DroneState ──────────────
+
+
+class TestExitIntentStamped:
+    def test_requested_at_and_reason_stamped_onto_state(self):
+        reg = ActiveSessionRegistry()
+        tracker = DroneStateTracker()
+        _register_session(reg, "flight-001", "drone-01")
+        _add_telemetry_state(tracker, "flight-001", "drone-01")
+
+        payload = ExitRequestPayload(
+            flight_session_id="flight-001",
+            reason="drone_left_early",
+            requested_at="2026-04-21T19:00:00Z",
+        )
+        process_exit_request(payload, reg, tracker)
+
+        state = tracker.get("flight-001")
+        assert state is not None
+        assert state.exit_requested_at == "2026-04-21T19:00:00Z"
+        assert state.exit_reason == "drone_left_early"
+
+    def test_missing_requested_at_defaults_to_now(self):
+        reg = ActiveSessionRegistry()
+        tracker = DroneStateTracker()
+        _register_session(reg, "flight-001", "drone-01")
+        _add_telemetry_state(tracker, "flight-001", "drone-01")
+
+        payload = ExitRequestPayload(flight_session_id="flight-001")
+        process_exit_request(payload, reg, tracker)
+
+        state = tracker.get("flight-001")
+        assert state is not None
+        assert state.exit_requested_at is not None
+        assert state.exit_reason == "unspecified"
+
+    def test_second_exit_request_does_not_overwrite_first(self):
+        reg = ActiveSessionRegistry()
+        tracker = DroneStateTracker()
+        _register_session(reg, "flight-001", "drone-01")
+        _add_telemetry_state(tracker, "flight-001", "drone-01")
+
+        first = ExitRequestPayload(
+            flight_session_id="flight-001",
+            reason="drone_left_early",
+            requested_at="2026-04-21T19:00:00Z",
+        )
+        second = ExitRequestPayload(
+            flight_session_id="flight-001",
+            reason="operator_recall",
+            requested_at="2026-04-21T19:05:00Z",
+        )
+        process_exit_request(first, reg, tracker)
+        process_exit_request(second, reg, tracker)
+
+        state = tracker.get("flight-001")
+        assert state.exit_requested_at == "2026-04-21T19:00:00Z"
+        assert state.exit_reason == "drone_left_early"
+
+    def test_no_telemetry_state_is_not_an_error(self):
+        reg = ActiveSessionRegistry()
+        tracker = DroneStateTracker()
+        _register_session(reg, "flight-001", "drone-01")
+        # No telemetry — tracker has no state for this session.
+
+        payload = ExitRequestPayload(flight_session_id="flight-001")
+        result = process_exit_request(payload, reg, tracker)
+
+        # Still accepted; stamping is a best-effort no-op when state is absent.
+        assert result["action"] == "accepted"
+        assert tracker.get("flight-001") is None
+
+
 # ── process_exit_request(): session not found ────────────────────────────────
 
 
