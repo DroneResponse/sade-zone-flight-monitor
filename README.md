@@ -367,8 +367,10 @@ sade/
 │
 ├── local_testing/
 │   ├── drone_sim.py                # Simulates a drone: publishes MQTT telemetry + mission lifecycle
-│   ├── mqtt_publisher_client/      # Low-level MQTT publish helper used by drone_sim
-│   ├── drone_mqtt_client.py        # Standalone drone MQTT client
+│   ├── mqtt_publisher_client       # Low-level MQTT publish helper (loaded via SourceFileLoader by drone_sim)
+│   ├── missions/
+│   │   ├── sample_mission.json     # Example mission waypoint data
+│   │   └── fly_waypoints_mission.json
 │   └── local_testing_run_guide.txt # Notes on running local tests manually
 │
 ├── scripts/
@@ -380,10 +382,6 @@ sade/
 │
 ├── docs/
 │   └── EXIT_POLICY_DESIGN.md       # Data-flow map and planned new exit-policy design
-│
-├── missions/
-│   ├── sample_mission.json         # Example mission waypoint data
-│   └── fly_waypoints_mission.json
 │
 ├── tests/
 │   ├── unit/
