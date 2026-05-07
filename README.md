@@ -86,7 +86,7 @@ State is removed from memory after the POST. A1 used to also POST and close the 
 
 ### `aws` mode (production)
 
-Drones are only tracked if they have a pre-registered approved session in the `ActiveSessionRegistry`. Sessions enter the registry via the `POST /flight-monitor/register-session` webhook (per `SADE_AWS_API_INFORMATION/FLIGHT_MONITOR_CONTRACT.md`), which SADE posts to this service after approving a flight.
+Drones are only tracked if they have a pre-registered approved session in the `ActiveSessionRegistry`. Sessions enter the registry via the `POST /flight-monitor/register-session` webhook — payload shape per [SADE_AWS_API_INFORMATION/SADE_CONTRACT.md](SADE_AWS_API_INFORMATION/SADE_CONTRACT.md), implementation details (status codes, retry, sweeper) per [FLIGHT_MONITOR_CONTRACT.md](SADE_AWS_API_INFORMATION/FLIGHT_MONITOR_CONTRACT.md). SADE posts to this service after approving a flight.
 
 If a telemetry message arrives for a drone with no registered session, it is silently dropped.
 
@@ -106,7 +106,7 @@ All endpoints are served by the FastAPI app in `app/api/server.py` on port `8000
 
 ### `POST /flight-monitor/register-session`  — primary registration endpoint
 
-Contract-aligned endpoint matching `SADE_AWS_API_INFORMATION/FLIGHT_MONITOR_CONTRACT.md`. Registration implicitly means the session has been approved by SADE. Once registered, MQTT telemetry published by the drone will be accepted and tracked.
+Payload shape per [SADE_AWS_API_INFORMATION/SADE_CONTRACT.md](SADE_AWS_API_INFORMATION/SADE_CONTRACT.md); implementation behaviour per [FLIGHT_MONITOR_CONTRACT.md](SADE_AWS_API_INFORMATION/FLIGHT_MONITOR_CONTRACT.md). Registration implicitly means the session has been approved by SADE. Once registered, MQTT telemetry published by the drone will be accepted and tracked.
 
 - `202 Accepted` — session registered, telemetry tracking active
 - `409 Conflict` — the drone already has an active session, registration rejected

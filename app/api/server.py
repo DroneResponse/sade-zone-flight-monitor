@@ -1,10 +1,14 @@
 """FastAPI server for SADE Flight Monitor session lifecycle.
 
+Payload shapes per SADE_AWS_API_INFORMATION/SADE_CONTRACT.md (authoritative);
+the Flight-Monitor-implementation side (status codes, retry, sweeper,
+trigger cases) is documented in FLIGHT_MONITOR_CONTRACT.md.
+
 Endpoints:
   POST /flight-monitor/register-session
-    Receives session registration commands from the SADE outbox per the
-    FLIGHT_MONITOR_CONTRACT.md integration contract.  Once registered, the
-    telemetry pipeline's workers begin accepting MQTT messages for that drone.
+    Receives session registration commands from the SADE outbox.  Once
+    registered, the telemetry pipeline's workers begin accepting MQTT
+    messages for that drone.
 
   POST /flight-monitor/exit-request
     Receives exit notifications from SADE when a drone leaves a zone early
@@ -454,10 +458,10 @@ async def register_session(
 ) -> JSONResponse:
     """Register a SADE-approved flight session for telemetry monitoring.
 
-    This is the contract endpoint per FLIGHT_MONITOR_CONTRACT.md.
-    Registration implicitly means the session has been approved by the SADE
-    decision workflow.  Once registered, MQTT telemetry published by the
-    drone will be accepted and tracked by the pipeline workers.
+    Payload shape per SADE_CONTRACT.md.  Registration implicitly means
+    the session has been approved by the SADE decision workflow.  Once
+    registered, MQTT telemetry published by the drone will be accepted
+    and tracked by the pipeline workers.
 
     When ``test_overrides`` is present, the real MQTT telemetry path is
     bypassed.  Instead, a background task waits 5 seconds and then POSTs a

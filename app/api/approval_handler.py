@@ -1,10 +1,12 @@
 """Pydantic model + business logic for the session registration webhook.
 
 Separated from the HTTP layer (server.py) so the registration logic can be
-tested without standing up a web server.  Matches the registration contract
-in SADE_AWS_API_INFORMATION/FLIGHT_MONITOR_CONTRACT.md — a call into this
-endpoint implicitly means SADE has already approved the session, so there is
-no decision/status field to evaluate here.
+tested without standing up a web server.  Payload shape per
+SADE_AWS_API_INFORMATION/SADE_CONTRACT.md (authoritative); see
+FLIGHT_MONITOR_CONTRACT.md for the Flight-Monitor-implementation
+side (status codes, retry, etc.).  A call into this endpoint implicitly
+means SADE has already approved the session — there is no decision/status
+field to evaluate here.
 """
 
 from __future__ import annotations
@@ -22,10 +24,10 @@ LOGGER = logging.getLogger(__name__)
 class RegisterSessionPayload(BaseModel):
     """Incoming JSON body for ``POST /flight-monitor/register-session``.
 
-    Matches the registration request contract in FLIGHT_MONITOR_CONTRACT.md.
-    Registration implicitly means the session is approved — there is no
-    ``decision`` field.  ``flight_session_id`` is the only required
-    cross-system correlation key.
+    Payload shape per SADE_CONTRACT.md.  Registration implicitly means
+    the session is approved — there is no ``decision`` field.
+    ``flight_session_id`` is the only required cross-system correlation
+    key.
     """
 
     flight_session_id: str
