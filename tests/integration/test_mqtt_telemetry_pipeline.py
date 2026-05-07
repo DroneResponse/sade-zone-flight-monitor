@@ -11,7 +11,8 @@ drones), use ``tests/integration/test_stub_finalization_override.py`` instead.
 This script keeps the local setup practical:
 - starts a local Mosquitto broker on localhost:1883 when needed
 - starts a FastAPI session registration server (by default)
-- starts the existing ingestion pipeline against the update_drone topic
+- starts the existing ingestion pipeline subscribed to the status_message and
+  update_drone topics (the publisher uses the first one)
 - sends an approved entry POST for each fake drone before it begins publishing
 - starts multiple fake drone telemetry publishers
 - writes ingestion results to a CSV file
@@ -580,7 +581,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # MQTT / broker
     parser.add_argument("--broker", default="localhost", help="MQTT broker host")
     parser.add_argument("--port", type=int, default=1883, help="MQTT broker port")
-    parser.add_argument("--topic", default="update_drone", help="Telemetry topic to publish/subscribe")
+    parser.add_argument("--topic", default="status_message", help="Telemetry topic to publish/subscribe")
 
     # Drone simulation
     parser.add_argument("--drone-count", type=int, default=3, help="Number of fake drones to publish")

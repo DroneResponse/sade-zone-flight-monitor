@@ -79,7 +79,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=int(os.getenv("MQTT_BROKER_PORT") or os.getenv("MQTT_PORT", "1883")),
     )
-    parser.add_argument("--topic", default=os.getenv("MQTT_TOPIC", "update_drone"))
+    parser.add_argument(
+        "--topic",
+        default=os.getenv("MQTT_TOPIC", "status_message,update_drone"),
+        help=(
+            "MQTT telemetry topic(s) to subscribe to.  Accepts a single "
+            "topic name or a comma-separated list (e.g. 'status_message,"
+            "update_drone').  Defaults cover both topic names currently "
+            "active in the fleet."
+        ),
+    )
     parser.add_argument(
         "--out",
         default=os.getenv("MISSION_ROWS_OUT", "mission_rows.csv"),
@@ -261,6 +270,11 @@ async def idle_message_watchdog(
         )
 
 
+def _parse_topics(value: str) -> list[str]:
+    """Parse a comma-separated MQTT topic list, dropping blanks/whitespace."""
+    return [t.strip() for t in (value or "").split(",") if t.strip()]
+
+
 async def run_pipeline(args: argparse.Namespace) -> None:
     """Create and run the telemetry pipeline until interrupted."""
     # Fail-fast on misconfigured finalization: if the pipeline is going to POST
@@ -281,11 +295,18 @@ async def run_pipeline(args: argparse.Namespace) -> None:
     # Future AWS integration can inject a pre-populated registry onto args.
     session_registry = getattr(args, "session_registry", None) or ActiveSessionRegistry()
 
+    topics = _parse_topics(args.topic)
+    if not topics:
+        raise RuntimeError(
+            "MQTT_TOPIC is empty.  Set at least one topic name "
+            "(comma-separated for multiple)."
+        )
+
     mqtt_client = TelemetryMqttIngestionClient(
         queue,
         broker=args.broker,
         port=args.port,
-        topic=args.topic,
+        topics=topics,
         metrics=metrics,
         # Auth / TLS fields are optional; local runs leave these as empty/False.
         username=getattr(args, "mqtt_username", "") or None,
@@ -340,10 +361,10 @@ async def run_pipeline(args: argparse.Namespace) -> None:
     )
 
     LOGGER.info(
-        "Pipeline started: broker=%s port=%s topic=%s workers=%s out=%s session_source_mode=%s idle_warning=%ss metrics_log_interval=%ss finalize_to_api=%s tracker_url=%s",
+        "Pipeline started: broker=%s port=%s topics=%s workers=%s out=%s session_source_mode=%s idle_warning=%ss metrics_log_interval=%ss finalize_to_api=%s tracker_url=%s",
         args.broker,
         args.port,
-        args.topic,
+        ",".join(topics),
         len(worker_tasks),
         args.out,
         args.session_source_mode,

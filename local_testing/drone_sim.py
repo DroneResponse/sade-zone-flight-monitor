@@ -3,7 +3,7 @@
 
 This module keeps the original interactive simulator behavior available while
 adding a simple autonomous telemetry publisher used by ``run_local_test.py``.
-The new publisher emits realistic-looking ``update_drone`` payloads that match
+The new publisher emits realistic-looking ``status_message`` payloads that match
 what the ingestion pipeline already expects.
 """
 
@@ -199,7 +199,7 @@ class DroneTelemetryProfile:
 
 
 class SimulatedDronePublisher:
-    """Background publisher that emits realistic telemetry to ``update_drone``."""
+    """Background publisher that emits realistic telemetry to ``status_message``."""
 
     def __init__(
         self,
@@ -207,7 +207,7 @@ class SimulatedDronePublisher:
         *,
         broker: str = "localhost",
         port: int = 1883,
-        topic: str = "update_drone",
+        topic: str = "status_message",
         publish_interval: float = 1.0,
         logger: Callable[[str], None] | None = None,
     ) -> None:

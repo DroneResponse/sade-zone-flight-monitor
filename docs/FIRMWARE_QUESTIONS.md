@@ -8,6 +8,14 @@ Two items below are potentially load-bearing for the Flight Monitor and warrant 
 
 ## 1. Two different MQTT topics in use across the fleet
 
+> **Status (2026-05-07): RESOLVED — Flight Monitor side.**
+> The deployed ground-control broker uses `status_message` as the canonical
+> topic, and we adopted the "Subscribe to both topics" option below: the
+> Flight Monitor now subscribes to both `status_message` and `update_drone`
+> by default (configurable via `MQTT_TOPIC`).  No drone telemetry should be
+> silently dropped at the subscription boundary anymore.  The historical
+> observation is retained for context.
+
 ### Observation
 - Drones **Orange** and **Aqua** publish telemetry to topic `update_drone`.
 - Drone **Blue** publishes the *same-shaped* payload to topic `status_message`.
@@ -54,5 +62,5 @@ Drone **Aqua** emitted the same telemetry payload **three times in ~0.9 ms**, al
 
 Neither item is an immediate blocker, but both shape decisions we're about to make:
 
-- **#1 (dual topics)** blocks any incident/alerting work on the Blue drone and any drone that also emits on `status_message`. High-priority to resolve before the dashboard ships, because a dashboard that silently excludes part of the fleet is worse than no dashboard.
+- **#1 (dual topics)** is resolved on the Flight Monitor side: the service now subscribes to both `status_message` and `update_drone` by default, so no telemetry is dropped at the subscription boundary. The firmware-side question of *whether to standardize on one canonical topic* is still open, but is no longer load-bearing for the dashboard.
 - **#2 (duplicate publishes)** is latent today but becomes load-bearing the moment we add any rate-of-change-based detection (arm-state segment boundaries, incident codes, low-altitude alerts). Worth resolving before that work starts so the detectors don't have to be retrofitted with dedupe.

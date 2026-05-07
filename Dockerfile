@@ -26,7 +26,7 @@ COPY run.py   .
 # MQTT broker — required for non-local deployments; point at your broker host.
 ENV MQTT_BROKER_HOST=localhost \
     MQTT_BROKER_PORT=1883 \
-    MQTT_TOPIC=update_drone \
+    MQTT_TOPIC=status_message,update_drone \
     MQTT_TLS_ENABLED=false
 # MQTT_USERNAME and MQTT_PASSWORD are intentionally NOT set here.
 # Pass them at runtime via -e or --env-file to avoid baking credentials

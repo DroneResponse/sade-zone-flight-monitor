@@ -17,13 +17,19 @@ import logging
 import ssl
 import time
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 from app.monitoring.pipeline_metrics import PipelineMetrics
 
 import paho.mqtt.client as mqtt
 
 LOGGER = logging.getLogger(__name__)
+
+# Default telemetry topics.  The fleet currently has drones publishing to
+# either ``status_message`` (deployed ground-control broker) or ``update_drone``
+# (older firmware / earlier captures), so the Flight Monitor subscribes to
+# both by default and the caller can override via MQTT_TOPIC.
+DEFAULT_TELEMETRY_TOPICS: tuple[str, ...] = ("status_message", "update_drone")
 
 
 def _reason_code_to_int(reason_code: Any) -> int:
@@ -52,7 +58,7 @@ class TelemetryMqttIngestionClient:
         loop: Optional[asyncio.AbstractEventLoop] = None,
         broker: str = "localhost",
         port: int = 1883,
-        topic: str = "update_drone",
+        topics: Optional[Sequence[str]] = None,
         keepalive: int = 30,
         metrics: Optional[PipelineMetrics] = None,
         # Auth / TLS — required for non-local brokers (e.g. AWS IoT Core, HiveMQ Cloud).
@@ -79,7 +85,10 @@ class TelemetryMqttIngestionClient:
                 loop at start time.
             broker: MQTT broker host.
             port: MQTT broker port.
-            topic: MQTT telemetry topic or wildcard topic filter.
+            topics: One or more MQTT telemetry topics to subscribe to.  When
+                omitted, defaults to ``DEFAULT_TELEMETRY_TOPICS`` so the
+                Flight Monitor captures both currently-active topic names in
+                the fleet.  A single-topic deployment can pass ``["foo"]``.
             keepalive: MQTT keepalive interval in seconds.
             username: Optional MQTT username for broker authentication.
             password: Optional MQTT password (used only when username is set).
@@ -109,7 +118,9 @@ class TelemetryMqttIngestionClient:
         self.loop = loop
         self.broker = broker
         self.port = port
-        self.topic = topic
+        self.topics: list[str] = (
+            [t for t in topics if t] if topics else list(DEFAULT_TELEMETRY_TOPICS)
+        )
         self.keepalive = keepalive
         self.metrics = metrics
         self.username = username
@@ -262,8 +273,12 @@ class TelemetryMqttIngestionClient:
             return
 
         LOGGER.info("Connected to MQTT broker (rc=%s)", rc)
-        client.subscribe(self.topic, qos=0)
-        LOGGER.info("Subscribed to topic: %s", self.topic)
+        # paho's subscribe() accepts a list of (topic, qos) tuples and emits
+        # a single SUBSCRIBE packet.  Listing topics in the log line keeps
+        # the existing "Subscribed to topic" prefix so log scrapers (e.g.
+        # scripts/run_e2e_aws_test.py) still match.
+        client.subscribe([(t, 0) for t in self.topics])
+        LOGGER.info("Subscribed to topics: %s", ", ".join(self.topics))
 
     def _on_message(self, client: mqtt.Client, userdata: Any, msg: mqtt.MQTTMessage) -> None:
         """Receive MQTT message and enqueue a normalized message envelope.
@@ -324,7 +339,7 @@ def start_mqtt_client(
     loop: Optional[asyncio.AbstractEventLoop] = None,
     broker: str = "localhost",
     port: int = 1883,
-    topic: str = "update_drone",
+    topics: Optional[Sequence[str]] = None,
     keepalive: int = 30,
     metrics: Optional[PipelineMetrics] = None,
     username: Optional[str] = None,
@@ -346,7 +361,7 @@ def start_mqtt_client(
         loop=loop,
         broker=broker,
         port=port,
-        topic=topic,
+        topics=topics,
         keepalive=keepalive,
         metrics=metrics,
         username=username,

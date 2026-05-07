@@ -32,7 +32,7 @@ ActiveSessionRegistry               ← in-memory store of approved sessions
     │  shared with workers
     ▼
 asyncio.Queue  ◄─── MQTT Broker ◄─── Drone telemetry (paho-mqtt)
-    │                (update_drone topic)
+    │                (status_message + update_drone topics)
     ▼
 Telemetry Worker(s)                 ← one or more async worker tasks
 (app/ingestion/workers.py)
@@ -199,7 +199,7 @@ Because this test writes a real record to SADE's database, it is **not** part of
 - A configured `.env` with real cert paths, `MQTT_CLIENT_ID`, and `TRACKER_FINALIZED_URL` set to the SADE ALB endpoint (or use `--dry-run` to skip the real POST)
 - Cert files present on disk at the configured paths
 - Port 8000 free on localhost
-- An IoT Core policy on your cert that allows `iot:Connect` / `iot:Subscribe` on `update_drone` (for the Flight Monitor role) and `iot:Publish` on `update_drone` (for the drone role)
+- An IoT Core policy on your cert that allows `iot:Connect` / `iot:Subscribe` on every topic in `MQTT_TOPIC` (default: `status_message,update_drone`) for the Flight Monitor role, and `iot:Publish` on the topic the drone publishes to (default: `status_message`) for the drone role
 
 **Run it:**
 
@@ -222,7 +222,7 @@ Artifacts land in `local_test_output/`: `e2e_aws_summary.txt` with the step-by-s
 |---|---|---|
 | `--broker` | `localhost` | MQTT broker host |
 | `--port` | `1883` | MQTT broker port |
-| `--topic` | `update_drone` | MQTT topic to subscribe to |
+| `--topic` | `status_message,update_drone` | MQTT topic(s) to subscribe to. Single name or comma-separated list. |
 | `--out` | `mission_rows.csv` | Path for CSV output (omit to disable) |
 | `--session-source-mode` | `local` | `local` or `aws` |
 | `--finalize-to-api` | off | POST finalization to SADE AWS on mission complete |
@@ -278,7 +278,7 @@ docker run -d --restart unless-stopped \
   -e MQTT_CLIENT_CERT_PATH=/certs/client.crt \
   -e MQTT_PRIVATE_KEY_PATH=/certs/client.key \
   -e MQTT_CLIENT_ID=tlohman-flight-monitor \
-  -e MQTT_TOPIC=update_drone \
+  -e MQTT_TOPIC=status_message,update_drone \
   -e SESSION_SOURCE_MODE=aws \
   -e FINALIZE_TO_API=true \
   -e TRACKER_FINALIZED_URL=http://your-sade-host.example.com/tracker-session-finalized \
@@ -292,7 +292,7 @@ docker run -d --restart unless-stopped \
 |---|---|---|
 | `MQTT_BROKER_HOST` | `localhost` | Required — set to your broker hostname |
 | `MQTT_BROKER_PORT` | `1883` | Use `8883` when TLS is enabled |
-| `MQTT_TOPIC` | `update_drone` | MQTT telemetry topic |
+| `MQTT_TOPIC` | `status_message,update_drone` | MQTT telemetry topic(s). Single value or comma-separated list. Pipeline subscribes to all listed topics. |
 | `MQTT_TLS_ENABLED` | `false` | Set `true` for cloud/managed brokers |
 | `MQTT_USERNAME` | _(unset)_ | Pass at runtime — do not bake into image |
 | `MQTT_PASSWORD` | _(unset)_ | Pass at runtime — do not bake into image |

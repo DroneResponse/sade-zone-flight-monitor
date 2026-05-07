@@ -66,7 +66,10 @@ LOGGER = logging.getLogger("e2e_aws")
 PATTERNS: dict[str, re.Pattern[str]] = {
     "mtls":               re.compile(r"MQTT transport: mTLS"),
     "connected":          re.compile(r"Connected to MQTT broker \(rc=0\)"),
-    "subscribed":         re.compile(r"Subscribed to topic: update_drone"),
+    # Match the multi-topic log line emitted by mqtt_client._on_connect.  The
+    # exact prefix is "Subscribed to topics: <comma-separated list>", and we
+    # want to advance as soon as the publisher's topic appears in that list.
+    "subscribed":         re.compile(r"Subscribed to topics?: .*status_message"),
     "final_row":          re.compile(r"wrote final mission row for drone_id=(?P<drone_id>\S+)"),
     "finalize_posting":   re.compile(r"Sending tracker finalization POST for flight_session_id=(?P<fsid>\S+)"),
     "finalize_done":      re.compile(
@@ -504,7 +507,7 @@ def run_e2e(args: argparse.Namespace) -> E2EResult:
                     f"see {FLIGHT_MONITOR_LOG_PATH} for details"
                 )
                 return result
-        LOGGER.info("[OK] Flight Monitor connected to IoT Core (mTLS) and subscribed to update_drone")
+        LOGGER.info("[OK] Flight Monitor connected to IoT Core (mTLS) and subscribed to telemetry topic(s)")
         result.steps_completed.extend(["readiness:mtls", "readiness:connected", "readiness:subscribed"])
 
         # Step 2: register session
@@ -528,7 +531,10 @@ def run_e2e(args: argparse.Namespace) -> E2EResult:
             private_key=merged_env["MQTT_PRIVATE_KEY_PATH"],
             broker=merged_env["MQTT_BROKER_HOST"],
             port=int(merged_env.get("MQTT_BROKER_PORT", "8883")),
-            topic=merged_env.get("MQTT_TOPIC", "update_drone"),
+            # The publisher publishes to a single topic.  When MQTT_TOPIC is
+            # a comma-separated list (matching the Flight Monitor's multi-
+            # subscription default), pick the first entry.
+            topic=merged_env.get("MQTT_TOPIC", "status_message").split(",")[0].strip(),
             drone_id=drone_id,
         )
         if not publisher.connect(timeout=15.0):
@@ -710,7 +716,7 @@ def write_summary(args: argparse.Namespace, result: E2EResult) -> None:
     all_steps = [
         ("readiness:mtls",       "Flight Monitor selected mTLS transport"),
         ("readiness:connected",  "Flight Monitor connected to IoT Core (rc=0)"),
-        ("readiness:subscribed", "Flight Monitor subscribed to update_drone"),
+        ("readiness:subscribed", "Flight Monitor subscribed to telemetry topic(s)"),
         ("register-session",     "POST /flight-monitor/register-session → 202"),
         ("publisher-connect",    "E2E drone publisher connected to IoT Core"),
         ("telemetry-published",  f"Published {args.telemetry_count} on_mission messages"),
@@ -754,8 +760,9 @@ def write_summary(args: argparse.Namespace, result: E2EResult) -> None:
         lines.append("----------------")
         lines.append("1. Read the Flight Monitor log for connection / handshake errors.")
         lines.append("2. Confirm your IoT Core policy allows `iot:Connect` and `iot:Subscribe` on")
-        lines.append("   'update_drone' for MQTT_CLIENT_ID, and `iot:Publish` on the same topic")
-        lines.append("   for the publisher's e2e-drone client_id.")
+        lines.append("   every topic in MQTT_TOPIC (default: 'status_message,update_drone') for")
+        lines.append("   MQTT_CLIENT_ID, and `iot:Publish` on the publisher's topic for the")
+        lines.append("   e2e-drone client_id.")
         lines.append("3. If the failure is post-finalize, confirm TRACKER_FINALIZED_URL is reachable.")
         lines.append("")
 

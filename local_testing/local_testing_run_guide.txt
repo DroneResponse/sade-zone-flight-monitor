@@ -66,7 +66,10 @@ MQTT broker host. Default: localhost
 MQTT broker port. Default: 1883
 
 --topic
-Telemetry topic used by both publishers and ingestion. Default: update_drone
+Telemetry topic used by both publishers and ingestion. Default: status_message
+(The standalone `python run.py` entry point defaults to subscribing to both
+`status_message` and `update_drone`. This local-test runner uses one topic
+for both publisher and pipeline so the round-trip is symmetric.)
 
 --drone-count
 Number of fake drone publishers to start. Default: 3
@@ -126,7 +129,7 @@ Current Local Flow
 ------------------
 The current local flow is:
 
-fake drone publishes telemetry -> MQTT topic update_drone -> ingestion callback -> asyncio queue -> async worker -> active session resolution -> in-memory mission state tracking -> final mission row written on mission completion
+fake drone publishes telemetry -> MQTT topic status_message (or update_drone) -> ingestion callback -> asyncio queue -> async worker -> active session resolution -> in-memory mission state tracking -> final mission row written on mission completion
 
 During the run, the pipeline also logs lightweight metrics including current queue depth, max queue depth, average/max queue wait latency, average/max worker processing time, dropped messages, and final mission rows written.
 
@@ -135,7 +138,7 @@ Notes
 - The script uses localhost:1883.
 - If Mosquitto is already running on localhost:1883, the script reuses it.
 - Press Ctrl+C for a clean shutdown.
-- Fake drones publish realistic telemetry on the existing update_drone topic.
+- Fake drones publish realistic telemetry on the configured topic (default: status_message).
 - The default local mode is designed to keep testing simple even before AWS entry approval wiring is complete.
 
 Quick Troubleshooting
@@ -145,7 +148,7 @@ If the script cannot start the broker:
 - Check whether another process is already using port 1883.
 
 If no CSV rows appear in local mode:
-- Confirm the ingestion topic and publisher topic are both update_drone.
+- Confirm the ingestion topic and publisher topic match (default: status_message). When running the standalone service, the pipeline subscribes to both status_message and update_drone, so a publisher using either will work.
 - Check the runner log and Mosquitto log in local_test_output.
 
 If no CSV rows appear in aws mode:

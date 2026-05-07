@@ -4,7 +4,7 @@
 
 ### Entry points
 - **SADE → `POST /flight-monitor/register-session`** — `approval_handler.py` → `ActiveSessionRegistry`.
-- **Drone → MQTT `update_drone`** — `mqtt_client.py` → `workers.py` → `DroneStateTracker`.
+- **Drone → MQTT `status_message` / `update_drone`** — `mqtt_client.py` (subscribes to both) → `workers.py` → `DroneStateTracker`.
 - **SADE → `POST /flight-monitor/exit-request`** — `exit_handler.py` → stamps exit intent onto `DroneState`.
 
 ### Tracking (in-memory only)
