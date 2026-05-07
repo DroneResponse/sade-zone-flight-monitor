@@ -209,6 +209,11 @@ async def _run_exit_grace_period(
 
     exit_requested_at = asyncio.get_running_loop().time()
     last_seen_at_previous_check: str | None = None
+    # Monotonic timestamp of the most recent check that observed a fresh
+    # telemetry update.  Stays None until a change is observed; the silence
+    # calculation below falls back to ``exit_requested_at`` in that case so
+    # the no-telemetry-ever path keeps its existing behavior.
+    last_telemetry_change_monotonic: float | None = None
 
     while True:
         await asyncio.sleep(EXIT_GRACE_CHECK_INTERVAL_SECONDS)
@@ -228,7 +233,8 @@ async def _run_exit_grace_period(
         current_state = tracker.get(flight_session_id)
         current_last_seen = current_state.last_seen if current_state else None
 
-        minutes_since_exit = (asyncio.get_running_loop().time() - exit_requested_at) / 60.0
+        now_monotonic = asyncio.get_running_loop().time()
+        minutes_since_exit = (now_monotonic - exit_requested_at) / 60.0
 
         # If telemetry is still arriving, warn and reset the silence timer.
         if current_last_seen is not None and current_last_seen != last_seen_at_previous_check:
@@ -242,27 +248,23 @@ async def _run_exit_grace_period(
                 current_last_seen,
             )
             last_seen_at_previous_check = current_last_seen
-            # Reset: we need a full silence period from now.
+            # Reset the silence reference clock — we need a full silence
+            # period from now, not from the original exit-request time.
+            last_telemetry_change_monotonic = now_monotonic
             continue
 
-        # No new telemetry since the last check.  Has the full silence
-        # period elapsed since we last saw telemetry (or since the exit
-        # request if no telemetry was ever received)?
-        if last_seen_at_previous_check is None and current_last_seen is None:
-            # No telemetry was ever received for this session.  Use time
-            # since exit request as the silence measure.
-            silence_seconds = asyncio.get_running_loop().time() - exit_requested_at
-        else:
-            # Telemetry was received at some point but has now stopped.
-            # We've been through at least one check cycle with no change.
-            # Count consecutive silent check intervals.  Since we continue
-            # (reset) on every new message, reaching here means we've had
-            # at least EXIT_GRACE_CHECK_INTERVAL_SECONDS of silence.
-            # Use the loop elapsed time minus when we last saw a change.
-            silence_seconds = asyncio.get_running_loop().time() - exit_requested_at
-            # More precisely, we know last_seen hasn't changed for at least
-            # one check interval.  We'll let the loop accumulate until the
-            # full grace period passes.
+        # Silence reference clock: the last time we observed a telemetry
+        # change, or the exit-request time if no telemetry has ever been
+        # seen.  This keeps the grace window measured from when the drone
+        # actually went silent rather than from when the exit request
+        # arrived (which would prematurely finalize a still-transmitting
+        # drone shortly after EXIT_GRACE_PERIOD_SECONDS has elapsed).
+        silence_reference = (
+            last_telemetry_change_monotonic
+            if last_telemetry_change_monotonic is not None
+            else exit_requested_at
+        )
+        silence_seconds = now_monotonic - silence_reference
 
         if silence_seconds >= EXIT_GRACE_PERIOD_SECONDS:
             break

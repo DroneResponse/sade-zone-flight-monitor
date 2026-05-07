@@ -21,6 +21,9 @@ Scenarios tested:
   3. Natural completion during grace — worker finalizes session mid-grace,
      grace task detects it and exits cleanly
   4. Multiple simultaneous exits — several grace periods run independently
+  5. Telemetry then silence — register, exit, simulate telemetry mid-grace,
+     verify the silence clock resets so finalization is measured from when
+     telemetry stopped, not from when the exit request arrived
 """
 
 from __future__ import annotations
@@ -224,6 +227,98 @@ async def scenario_natural_completion(base_url: str) -> bool:
     return True
 
 
+async def scenario_telemetry_then_silence(base_url: str) -> bool:
+    """Scenario 5: Silence clock resets when telemetry arrives mid-grace.
+
+    Regression for the bug where ``silence_seconds`` was always measured
+    from ``exit_requested_at``, so a drone transmitting through most of
+    the grace window was force-finalized shortly after the original
+    exit-request crossed ``EXIT_GRACE_PERIOD_SECONDS`` — not the full
+    silence period after telemetry actually stopped.
+
+    With test constants (grace=10s, check=3s):
+      * t=0   exit-request → grace task starts
+      * t=~4  inject one fresh telemetry update (state_tracker.update)
+      * t=~6  grace task observes the change; under the fix, silence
+              clock resets to ``loop.time()``
+      * t=~14 (assertion A) under the buggy code, finalize would have
+              fired at the t=12 check (silence = 12 - 0 = 12 ≥ 10).
+              Under the fix, silence is only ~14 - 6 = 8 → still active.
+      * t=~20 (assertion B) silence ≈ 20 - 6 = 14 ≥ 10 → finalized.
+
+    Assertion A is the load-bearing check: it fails under the buggy
+    code and passes under the fix.
+    """
+    from datetime import datetime, timezone
+
+    from app.api.server import state_tracker
+
+    LOGGER.info("── Scenario 5: Telemetry then silence (silence-clock regression) ──")
+
+    fid = f"grace-tt-silence-{uuid4()}"
+    drone_id = "drone-tt-silence"
+    ok = await _register_session(base_url, fid, drone_id)
+    if not ok:
+        LOGGER.error("  FAIL: Registration failed")
+        return False
+
+    status, body = await _send_exit_request(base_url, fid)
+    if status != 202 or body.get("action") != "accepted":
+        LOGGER.error("  FAIL: Exit request not accepted (HTTP %s action=%s)", status, body.get("action"))
+        return False
+    LOGGER.info("  Exit request accepted at t=0; grace task running")
+
+    # Wait until just after the first check tick (t=3) and inject a fresh
+    # telemetry timestamp.  The next check (t=6) will pick this up as a
+    # change and reset the silence reference clock.
+    await asyncio.sleep(4.0)
+    state_tracker.update(
+        fid,
+        drone_id=drone_id,
+        session_source="aws",
+        raw_message={},
+        parsed_payload={},
+        mission_status=None,
+        mode=None,
+        position=None,
+        last_seen=datetime.now(timezone.utc).isoformat(),
+    )
+    LOGGER.info("  Injected one telemetry update at t≈4")
+
+    # ── Assertion A ──────────────────────────────────────────────────
+    # Wait to t≈14 — past the t=12 mark where the buggy code would have
+    # finalized (silence_seconds = 12 - 0 = 12 ≥ 10).  Under the fix,
+    # silence is measured from the t≈6 observation, so silence ≈ 8 and
+    # the session must still be active.
+    await asyncio.sleep(10.0)
+    active = await _get_active_sessions(base_url)
+    if active != 1:
+        LOGGER.error(
+            "  FAIL (assertion A): expected session to still be active at t≈14 "
+            "(buggy code would have finalized at t=12). Got active=%d. "
+            "This indicates the silence-clock reset is not working.",
+            active,
+        )
+        return False
+    LOGGER.info("  PASS (assertion A): session still active at t≈14 (silence clock reset working)")
+
+    # ── Assertion B ──────────────────────────────────────────────────
+    # Wait to t≈20 — silence ≈ 20 - 6 = 14 ≥ 10, so the t=18 check
+    # should have broken out of the loop and finalization should have
+    # completed (registry.complete + POST attempt) by now.
+    await asyncio.sleep(6.0)
+    active = await _get_active_sessions(base_url)
+    if active != 0:
+        LOGGER.error(
+            "  FAIL (assertion B): expected session finalized at t≈20, got active=%d",
+            active,
+        )
+        return False
+
+    LOGGER.info("  PASS (assertion B): session finalized at t≈20 (full silence period elapsed)")
+    return True
+
+
 async def scenario_multiple_exits(base_url: str) -> bool:
     """Scenario 4: Multiple grace periods run independently."""
     LOGGER.info("── Scenario 4: Multiple simultaneous exits ──")
@@ -287,6 +382,7 @@ async def run_test(args: argparse.Namespace) -> bool:
         results.append(("Basic grace period", await scenario_basic_grace_period(base_url)))
         results.append(("Session not found", await scenario_not_found(base_url)))
         results.append(("Natural completion", await scenario_natural_completion(base_url)))
+        results.append(("Telemetry then silence", await scenario_telemetry_then_silence(base_url)))
         results.append(("Multiple exits", await scenario_multiple_exits(base_url)))
     finally:
         api_task.cancel()
