@@ -362,6 +362,77 @@ async def register_session(
     return JSONResponse(content=result, status_code=status_code)
 
 
+# ── Canonical SADE finalize sequence ─────────────────────────────────────────
+
+
+async def _finalize_session_to_sade(
+    reg: ActiveSessionRegistry,
+    tracker: DroneStateTracker,
+    flight_session_id: str,
+    *,
+    reason: str,
+) -> bool:
+    """Run the canonical finalize sequence: capture state, clear, build, POST.
+
+    Used by both the exit-grace-period handler and the force-close
+    backstop sweeper.  Centralises:
+      1. ``tracker.pop`` + ``reg.complete`` to remove session state
+      2. Synthetic DroneState fallback when no telemetry was observed
+         (so the SADE payload still satisfies the contract)
+      3. ``build_finalization_payload`` (one source of truth for shape)
+      4. ``post_tracker_session_finalized`` with retry/backoff
+
+    ``reason`` shows up in the log line so we can tell the call sites
+    apart when grepping (e.g. ``exit_grace_elapsed`` vs
+    ``force_close_backstop``).
+
+    Returns True if telemetry was observed (real DroneState used),
+    False if a synthetic minimal payload was built.  Returns False
+    silently when neither registry nor tracker had the session — that
+    means another path beat us to it (e.g. concurrent grace task) and
+    the caller should not treat it as an error.
+    """
+    captured_state = tracker.pop(flight_session_id)
+    session = reg.complete(flight_session_id)
+    if captured_state is None and session is None:
+        return False
+
+    # ── FLIGHT-SEGMENT CLOSE HOOK ────────────────────────────────────────
+    # When arm-state-based segment detection is in place, any segment still
+    # open on captured_state must be closed here before the payload is
+    # built — close at captured_state.last_seen and tag closed_by="finalize".
+    if captured_state is not None:
+        payload = build_finalization_payload(captured_state)
+        had_telemetry = True
+    else:
+        # No telemetry was ever observed for this session.  Build a minimal
+        # contract-valid finalization by running a synthetic DroneState
+        # through the normal payload builder — same code path, one shape.
+        now_iso = datetime.now(timezone.utc).isoformat()
+        entry_time = session.requested_entry_time if session else None
+        synthetic_state = DroneState(
+            flight_session_id=flight_session_id,
+            drone_id=session.drone_id if session else None,
+            session_source=session.session_source if session else "aws",
+            first_seen=entry_time or now_iso,
+            last_seen=now_iso,
+            latest_raw_message={},
+            latest_parsed_payload={},
+        )
+        payload = build_finalization_payload(synthetic_state)
+        had_telemetry = False
+
+    await post_tracker_session_finalized(payload)
+
+    LOGGER.info(
+        "Session finalized to SADE: flight_session_id=%s reason=%s had_telemetry=%s",
+        flight_session_id,
+        reason,
+        had_telemetry,
+    )
+    return had_telemetry
+
+
 # ── Exit grace period monitor (exit-request path) ────────────────────────────
 
 
@@ -462,41 +533,8 @@ async def _run_exit_grace_period(
         drone_id,
     )
 
-    # Capture and remove state.
-    captured_state = tracker.pop(flight_session_id)
-    session = reg.complete(flight_session_id)
-
-    # ── FLIGHT-SEGMENT CLOSE HOOK ────────────────────────────────────────
-    # When arm-state-based segment detection is in place, any segment still
-    # open on captured_state must be closed here before the payload is
-    # built — close at captured_state.last_seen and tag closed_by="finalize".
-    # Same hook applies at the worker-side terminal-message finalize path
-    # (the "mission_completed" branch that also calls build_finalization_payload).
-    if captured_state is not None:
-        payload = build_finalization_payload(captured_state)
-    else:
-        # No telemetry was ever observed for this session.  Build a minimal
-        # contract-valid finalization by running a synthetic DroneState
-        # through the normal payload builder — same code path, one shape.
-        now_iso = datetime.now(timezone.utc).isoformat()
-        entry_time = session.requested_entry_time if session else None
-        synthetic_state = DroneState(
-            flight_session_id=flight_session_id,
-            drone_id=drone_id,
-            session_source=session.session_source if session else "aws",
-            first_seen=entry_time or now_iso,
-            last_seen=now_iso,
-            latest_raw_message={},
-            latest_parsed_payload={},
-        )
-        payload = build_finalization_payload(synthetic_state)
-
-    await post_tracker_session_finalized(payload)
-
-    LOGGER.info(
-        "Exit finalization complete: flight_session_id=%s had_telemetry=%s",
-        flight_session_id,
-        captured_state is not None,
+    await _finalize_session_to_sade(
+        reg, tracker, flight_session_id, reason="exit_grace_elapsed",
     )
 
 
