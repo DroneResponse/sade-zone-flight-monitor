@@ -387,6 +387,13 @@ app = FastAPI(
     lifespan=_lifespan,
 )
 
+# Read-only HTML+JSON dashboard at /dashboard.  Imported here (after `app`
+# exists so the dashboard module can read this module's registry/state_tracker
+# without a circular import at top-level).
+from app.api.dashboard import router as _dashboard_router  # noqa: E402
+
+app.include_router(_dashboard_router)
+
 
 def get_registry() -> ActiveSessionRegistry:
     """FastAPI dependency that provides the shared session registry.

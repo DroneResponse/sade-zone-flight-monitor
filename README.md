@@ -130,7 +130,15 @@ Notifies the Flight Monitor that a drone has left the zone early (or the session
 
 ### `GET /health`
 
-Returns `{"status": "ok", "active_sessions": <count>}`.
+Returns `{"status": "ok", "active_sessions": <count>, "sessions_past_deadline": <count>, "sessions_stranded": <count>}`. The two flag counters come from the periodic sweeper.
+
+### `GET /dashboard`  — live drone-status web page
+
+A self-contained HTML page (vanilla CSS + JS, no build step, no external dependencies) that renders the current registry + telemetry state grouped by zone. Polls `/dashboard/data` every 7 seconds. Shows per-drone status (FLYING / LANDED / WAITING / EXIT_REQUESTED / ACTIVE) plus deadline-breach and stranded flags. Read-only — exposes no controls. **Not authenticated** — same gap as the webhooks; do not expose to the public internet without auth in front.
+
+### `GET /dashboard/data`  — JSON snapshot for the dashboard
+
+Programmatic JSON shape backing the dashboard page. Suitable for any other monitoring tool that wants live state. Same in-memory snapshot, no caching.
 
 ---
 
