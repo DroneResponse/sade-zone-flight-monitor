@@ -57,6 +57,13 @@ OUTPUT_DIR = REPO_ROOT / "local_test_output"
 
 LOGGER = logging.getLogger("run_local_test")
 
+# Shortened exit-grace constants for testing.  The production values
+# (300s grace / 30s check) would make this test take 5+ minutes; with
+# these the post-schedule finalization flow finishes in ~15s.
+TEST_GRACE_PERIOD_SECONDS = 10.0
+TEST_GRACE_CHECK_INTERVAL_SECONDS = 3.0
+GRACE_BUFFER_SECONDS = 5.0
+
 
 # ── Module loading helpers ────────────────────────────────────────────────────
 
@@ -275,12 +282,92 @@ async def _post_register_session(
         return False
 
 
+# ── Exit-request driver (replaces drone-driven session close) ────────────────
+
+
+async def _send_exit_requests_and_wait_for_grace(
+    api_base_url: str,
+    shared_registry,
+) -> None:
+    """Drive each session through the SADE-owned exit flow.
+
+    Terminal MQTT no longer closes sessions — finalization authority belongs
+    to SADE.  After all drones have published ``mission_completed`` this
+    function plays the role SADE will play in production: POST one
+    exit-request per active session, then wait for the grace period to
+    elapse so the sessions are finalized end-to-end.
+
+    Logs the active-session count before and after for at-a-glance
+    verification of the new lifecycle.  Skipped under --skip-approval-api,
+    which doesn't run the FastAPI server / shared registry.
+    """
+    if shared_registry is None:
+        LOGGER.info("Approval API disabled — skipping exit-request finalization flow.")
+        return
+
+    sessions = list(shared_registry.snapshot().items())
+    LOGGER.info(
+        "Active sessions before exit-request: %d (terminal MQTT no longer closes sessions)",
+        len(sessions),
+    )
+    if not sessions:
+        LOGGER.info("No active sessions to exit — nothing to finalize.")
+        return
+
+    for fid, _session in sessions:
+        url = f"{api_base_url}/flight-monitor/exit-request"
+        payload = {
+            "flight_session_id": fid,
+            "reason": "drone_left_early",
+        }
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        def _do_post() -> dict:
+            with urllib.request.urlopen(request, timeout=10) as resp:
+                return json.loads(resp.read())
+
+        try:
+            result = await asyncio.to_thread(_do_post)
+            LOGGER.info(
+                "Exit request POSTed: flight_session_id=%s action=%s",
+                fid,
+                result.get("action"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Exit request failed for %s: %s", fid, exc)
+
+    wait = TEST_GRACE_PERIOD_SECONDS + GRACE_BUFFER_SECONDS
+    LOGGER.info(
+        "Waiting %.0fs for grace period to elapse (grace=%.0fs check=%.0fs)...",
+        wait,
+        TEST_GRACE_PERIOD_SECONDS,
+        TEST_GRACE_CHECK_INTERVAL_SECONDS,
+    )
+    await asyncio.sleep(wait)
+
+    remaining = shared_registry.count()
+    if remaining == 0:
+        LOGGER.info("All sessions finalized after grace period (active_sessions=0).")
+    else:
+        LOGGER.warning(
+            "Expected 0 active sessions after grace period, got %d. "
+            "Check the Flight Monitor log for finalization errors.",
+            remaining,
+        )
+
+
 # ── Ingestion pipeline ────────────────────────────────────────────────────────
 
 async def _run_ingestion_pipeline(
     args: argparse.Namespace,
     *,
     session_registry=None,
+    state_tracker=None,
     session_source_mode: str | None = None,
 ) -> None:
     """Run the existing ingestion pipeline as an in-process async task.
@@ -307,10 +394,17 @@ async def _run_ingestion_pipeline(
         metrics_log_interval=args.metrics_log_interval,
         memory_sample_interval=getattr(args, "memory_sample_interval", 0.0),
         log_level=args.log_level,
-        # Inject the shared registry so the pipeline and API server see the
-        # same sessions. None here tells the pipeline to create its own.
+        # Inject the shared registry and state tracker so the pipeline and
+        # API server see the same sessions and the same telemetry state.
+        # Without sharing state_tracker, the worker writes into one tracker
+        # and the exit-grace handler reads from another, which makes the
+        # finalization payload synthesize empty data instead of using the
+        # real accumulated telemetry.  Production goes through run_service()
+        # which sets both — this mirrors that wiring.
         session_registry=session_registry,
-        # Forward the finalize-to-api flag so workers POST to SADE on completion.
+        state_tracker=state_tracker,
+        # Forward the finalize-to-api flag so the pipeline does its
+        # TRACKER_FINALIZED_URL pre-flight check at startup.
         finalize_to_api=getattr(args, "finalize_to_api", False),
     )
     await ingestion_main.run_pipeline(pipeline_args)
@@ -446,6 +540,7 @@ async def run_local_test(args: argparse.Namespace) -> None:
     schedule_task = None
     stop_event = asyncio.Event()
     shared_registry = None
+    shared_state_tracker = None
     effective_session_mode = args.session_source_mode
 
     def request_stop() -> None:
@@ -468,9 +563,24 @@ async def run_local_test(args: argparse.Namespace) -> None:
             )
             fastapi_app = api_server_mod.app
 
-            # The pipeline will receive this same registry instance so that
-            # sessions registered by the API are immediately visible to workers.
+            # Patch the grace-period constants so the post-schedule
+            # exit-request finalization flow completes in seconds, not
+            # minutes.  Must be set before any _run_exit_grace_period
+            # task is spawned (i.e. before the first exit-request POST).
+            api_server_mod.EXIT_GRACE_PERIOD_SECONDS = TEST_GRACE_PERIOD_SECONDS
+            api_server_mod.EXIT_GRACE_CHECK_INTERVAL_SECONDS = TEST_GRACE_CHECK_INTERVAL_SECONDS
+            LOGGER.info(
+                "Patched exit-grace constants for test: period=%.0fs check=%.0fs",
+                TEST_GRACE_PERIOD_SECONDS,
+                TEST_GRACE_CHECK_INTERVAL_SECONDS,
+            )
+
+            # The pipeline will receive these same instances so that sessions
+            # registered by the API are immediately visible to workers, and so
+            # that telemetry accumulated by the worker is visible to the
+            # exit-grace handler at finalization time.
             shared_registry = api_server_mod.registry
+            shared_state_tracker = api_server_mod.state_tracker
 
             LOGGER.info(
                 "Starting FastAPI webhook server at %s (api_host=%s api_port=%s)",
@@ -506,6 +616,7 @@ async def run_local_test(args: argparse.Namespace) -> None:
             _run_ingestion_pipeline(
                 args,
                 session_registry=shared_registry,
+                state_tracker=shared_state_tracker,
                 session_source_mode=effective_session_mode,
             ),
             name="ingestion-pipeline",
@@ -546,6 +657,12 @@ async def run_local_test(args: argparse.Namespace) -> None:
 
         if schedule_task in done and not stop_event.is_set():
             LOGGER.info("Publisher schedule completed")
+            # All drones have finished publishing (last message:
+            # mission_completed).  In the new exit policy that no longer
+            # closes the session — the test now plays SADE's role and
+            # POSTs an exit-request for each, then waits for the grace
+            # period to finalize them end-to-end.
+            await _send_exit_requests_and_wait_for_grace(api_base_url, shared_registry)
         elif stop_event.is_set():
             LOGGER.info("Stopping local test early due to shutdown request")
 
@@ -715,6 +832,26 @@ def main() -> int:
     _ensure_import_paths()
     args = build_arg_parser().parse_args()
     configure_logging(args)
+
+    # Pre-flight: TRACKER_FINALIZED_URL is required when the approval API is
+    # in use because, with terminal MQTT no longer closing sessions, the test
+    # finalizes each session via the SADE exit-request grace flow — which
+    # POSTs to that URL.  Catching it here avoids a misleading "all sessions
+    # still active after grace" failure ~30s into the run.
+    if not args.skip_approval_api:
+        from app.sending.tracker_finalizer import get_tracker_finalized_url
+        try:
+            get_tracker_finalized_url()
+        except RuntimeError as exc:
+            LOGGER.error(
+                "Pre-flight check failed: %s\n"
+                "Set TRACKER_FINALIZED_URL before running this test (or pass "
+                "--skip-approval-api to use legacy 'local' session mode without "
+                "the SADE finalize round-trip).  Example:\n"
+                "    set -a; . ./.env; set +a; python %s",
+                exc, sys.argv[0],
+            )
+            return 2
 
     try:
         asyncio.run(run_local_test(args))

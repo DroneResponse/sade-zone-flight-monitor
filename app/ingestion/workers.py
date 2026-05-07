@@ -24,7 +24,6 @@ from app.monitoring.mission_row_builder import MissionRowBuilder
 from app.common.mission_row_writer import MissionCsvWriter
 from app.monitoring.pipeline_metrics import PipelineMetrics
 from app.monitoring.state_tracker import DroneStateTracker
-from app.sending.tracker_finalizer import build_finalization_payload, post_tracker_session_finalized
 
 LOGGER = logging.getLogger(__name__)
 
@@ -149,7 +148,6 @@ async def telemetry_worker(
     session_registry: ActiveSessionRegistry | None = None,
     session_source_mode: str = "local",
     metrics: PipelineMetrics | None = None,
-    finalize_to_api: bool = False,
 ) -> None:
     """Consume telemetry, resolve sessions, update state, and write on finish."""
     LOGGER.info("%s started (session_source_mode=%s)", worker_name, session_source_mode)
@@ -217,13 +215,17 @@ async def telemetry_worker(
                 state.session_source,
             )
 
-            # Finalize the mission exactly once when a terminal status arrives.
+            # Terminal MQTT status writes the local CSV row exactly once but
+            # does NOT close the session.  Finalization authority belongs to
+            # SADE: the session stays alive in the registry/state_tracker
+            # until SADE sends /flight-monitor/exit-request (which kicks off
+            # _run_exit_grace_period in app/api/server.py) or the session
+            # sweeper detects it as stranded.  Drones cannot self-close.
             if _is_terminal_mission_status(state.mission_status) and not state.row_written:
                 row = mission_row_builder.build_row(state)
                 state.row_written = True
 
-                # CSV write — always on when a row_writer is provided.
-                # This is the local testing path and is independent of the API path.
+                # CSV write — local-testing diagnostic, independent of SADE.
                 if row_writer is not None:
                     row_writer.write_row(row)
                     LOGGER.info(
@@ -234,23 +236,17 @@ async def telemetry_worker(
                         state.session_source,
                     )
 
-                # API finalization — POST to SADE when running in non-local mode.
-                # Enabled via --finalize-to-api; CSV and API paths are independent.
-                #
-                # FLIGHT-SEGMENT CLOSE HOOK: when arm-state-based segment
-                # detection is in place, any segment still open on `state`
-                # must be closed here before build_finalization_payload runs
-                # — close at state.last_seen, tag closed_by="finalize".
-                # Same hook exists in the exit-grace-period finalize path in
-                # app/api/server.py; keep them in lockstep.
-                if finalize_to_api:
-                    fin_payload = build_finalization_payload(state)
-                    await post_tracker_session_finalized(fin_payload)
+                LOGGER.info(
+                    "%s terminal MQTT status received; awaiting SADE exit-request "
+                    "or sweeper. drone_id=%s flight_session_id=%s mission_status=%s",
+                    worker_name,
+                    drone_id,
+                    state.flight_session_id,
+                    state.mission_status,
+                )
 
                 if metrics is not None:
                     metrics.observe_final_row_written()
-                state_tracker.pop(state.flight_session_id)
-                active_sessions.complete(state.flight_session_id)
 
             if metrics is not None:
                 metrics.observe_processed(time.monotonic() - processing_started_monotonic)

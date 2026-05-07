@@ -1,5 +1,10 @@
 # Flight Monitor — Data Flow & Exit Policy
 
+> **Implementation status (2026-05-07):**
+> - **Done**: Case A1 (terminal MQTT triggering SADE finalize) is removed. Terminal MQTT now writes only the local CSV row; the session stays alive until SADE sends an exit-request.
+> - **Pending**: Periodic sweeper for `requested_exit_time` deadline-breach flagging and stranded-session detection (B3 below). Memory leak from "session never gets an exit-request" remains until that lands.
+> The rest of this document is the original design narrative — kept as-is so the rollout context isn't lost.
+
 ## 1. Current system
 
 ### Entry points

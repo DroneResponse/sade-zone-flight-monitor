@@ -333,7 +333,6 @@ async def run_pipeline(args: argparse.Namespace) -> None:
                 session_registry=session_registry,
                 session_source_mode=args.session_source_mode,
                 metrics=metrics,
-                finalize_to_api=getattr(args, "finalize_to_api", False),
             )
         )
         for index in range(max(1, args.workers))
