@@ -198,6 +198,28 @@ python tests/integration/test_exit_request_grace_period.py
 
 The unit suite covers the approval handler, exit handler, MQTT workers, active session registry, mission row builder, pipeline metrics, state tracker, and tracker finalizer. The integration scripts each exercise one end-to-end slice: MQTT telemetry → finalization, `test_overrides` stub path, and exit-request grace period.
 
+### Live demo for presentations — `scripts/run_demo.py`
+
+Walks an audience through the full system in one self-contained Python process: pre-flight, service boot, two drones registering, arming, flying (with a multi-segment arm/disarm/arm sequence on one drone), exit-request → grace-period finalize → SADE catcher receiving the payload, clean shutdown. The dashboard at `http://localhost:8000/dashboard` updates live throughout.
+
+Pause-on-Enter between phases by default so the presenter can talk; pass `--auto` to run unattended with fixed pauses.
+
+```bash
+# Make sure mosquitto is running on localhost:1883 first.
+brew services start mosquitto
+
+# Interactive demo (Enter to advance between phases)
+./venv/bin/python scripts/run_demo.py
+
+# Auto-advance for a quick smoke run (~90s)
+./venv/bin/python scripts/run_demo.py --auto
+
+# Show every per-message worker log line
+./venv/bin/python scripts/run_demo.py --verbose
+```
+
+The script overrides the sweeper / grace / force-close timing constants to short values (8s grace, 5s sweeper, 30s stranded threshold, 60s force-close) so every behaviour is observable in a few minutes. Production values are 5-10× larger.
+
 ### End-to-end test against real AWS (IoT Core + SADE)
 
 `scripts/run_e2e_aws_test.py` exercises the complete production code path against real AWS infrastructure — mTLS to IoT Core, real outbound POST to SADE's `/tracker-session-finalized`. It spawns the Flight Monitor as a subprocess, plays SADE's outbox role by POSTing `/flight-monitor/register-session` locally, then plays the drone role by publishing real MQTT telemetry to IoT Core using the same mTLS cert (with a distinct `client_id`). Success means the Flight Monitor's log shows `Tracker session finalized: ... reputation_record_id=<id>` — i.e. SADE persisted a real reputation record.
@@ -384,6 +406,7 @@ sade/
 │
 ├── scripts/
 │   ├── run_flight_monitor.sh       # Env-file launcher with pre-flight config validation
+│   ├── run_demo.py                 # Live narrated demo — boots the system, walks 2 drones through arm/fly/disarm/exit
 │   ├── run_e2e_aws_test.py         # End-to-end test against real AWS IoT Core + SADE
 │   ├── run_stress_test.py          # Stress harness (configurable drone count / queue depth)
 │   ├── run_stress_test_sweep.py    # Parameter sweep across stress configurations
