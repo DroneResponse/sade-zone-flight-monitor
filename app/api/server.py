@@ -527,10 +527,8 @@ async def _finalize_session_to_sade(
     if captured_state is None and session is None:
         return False
 
-    # ── FLIGHT-SEGMENT CLOSE HOOK ────────────────────────────────────────
-    # When arm-state-based segment detection is in place, any segment still
-    # open on captured_state must be closed here before the payload is
-    # built — close at captured_state.last_seen and tag closed_by="finalize".
+    # build_finalization_payload auto-closes any still-open FlightSegment at
+    # captured_state.last_seen — no caller-side close needed.
     if captured_state is not None:
         payload = build_finalization_payload(captured_state)
         had_telemetry = True

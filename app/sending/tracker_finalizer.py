@@ -90,32 +90,45 @@ def build_finalization_payload(state: DroneState) -> dict[str, Any]:
       - battery state moves into each FLIGHT_SEGMENT as battery_state_{in,out}
       - EXIT_REQUEST appears in events when the operator asked to leave early
       - INCIDENT events are not emitted yet (blocked on incident-code mapping)
+
+    Flight-segment emission has two paths:
+
+      * Modern path — ``state.armed_field_seen`` is True (firmware emitted
+        ``status.armed`` at least once during the session): emit one
+        FLIGHT_SEGMENT per recorded segment in ``state.segments``.  Any
+        segment still open at finalize time is auto-closed using
+        ``state.last_seen`` as ``time_out_utc``.  An empty segments list
+        means the drone never armed; the result is zero FLIGHT_SEGMENT
+        events, which is the truthful "powered on but didn't fly" answer.
+
+      * Legacy fallback — ``armed_field_seen`` is False (older firmware
+        without an arm-state field, or the no-telemetry-ever synthetic
+        case): emit one synthetic FLIGHT_SEGMENT spanning
+        ``first_seen``→``last_seen`` with the session-level voltage_in /
+        voltage_out.  Identical to the pre-multi-segment behaviour.
     """
-    # ── FLIGHT-SEGMENT EMISSION ──────────────────────────────────────────
-    # Today: one synthetic FLIGHT_SEGMENT spanning first_seen→last_seen.
-    # When arm-state detection lands, replace this block with:
-    #
-    #     events: list[dict[str, Any]] = [
-    #         {
-    #             "type": "FLIGHT_SEGMENT",
-    #             "time_in_utc": _to_utc_z(seg.time_in_utc),
-    #             "time_out_utc": _to_utc_z(seg.time_out_utc),
-    #             "battery_state_in": _build_battery_state(seg.voltage_in),
-    #             "battery_state_out": _build_battery_state(seg.voltage_out),
-    #         }
-    #         for seg in state.segments
-    #     ]
-    #
-    # Any segment still open at finalize time must be closed by the caller
-    # (close at last_seen, tag closed_by="finalize") before this runs.
-    segment: dict[str, Any] = {
-        "type": "FLIGHT_SEGMENT",
-        "time_in_utc": _to_utc_z(state.first_seen),
-        "time_out_utc": _to_utc_z(state.last_seen),
-        "battery_state_in": _build_battery_state(state.voltage_in),
-        "battery_state_out": _build_battery_state(state.voltage_out),
-    }
-    events: list[dict[str, Any]] = [segment]
+    events: list[dict[str, Any]] = []
+
+    if state.armed_field_seen:
+        for seg in state.segments:
+            events.append({
+                "type": "FLIGHT_SEGMENT",
+                "time_in_utc": _to_utc_z(seg.time_in_utc),
+                # Auto-close at session.last_seen if still open.  Drones
+                # that disconnect mid-flight (battery dies, antenna fails)
+                # don't emit a clean disarm; this keeps the contract valid.
+                "time_out_utc": _to_utc_z(seg.time_out_utc or state.last_seen),
+                "battery_state_in": _build_battery_state(seg.voltage_in),
+                "battery_state_out": _build_battery_state(seg.voltage_out),
+            })
+    else:
+        events.append({
+            "type": "FLIGHT_SEGMENT",
+            "time_in_utc": _to_utc_z(state.first_seen),
+            "time_out_utc": _to_utc_z(state.last_seen),
+            "battery_state_in": _build_battery_state(state.voltage_in),
+            "battery_state_out": _build_battery_state(state.voltage_out),
+        })
 
     if state.exit_requested_at is not None:
         events.append({

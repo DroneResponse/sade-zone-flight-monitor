@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from app.monitoring.state_tracker import DroneState
+from app.monitoring.state_tracker import DroneState, FlightSegment
 from app.sending.tracker_finalizer import (
     TRACKER_FINALIZED_URL_ENV_VAR,
     _log_finalization_response,
@@ -182,6 +182,164 @@ class TestFlightSegmentEvent:
 
         assert segment["battery_state_in"]["system_charge_pct"] == 0.0
         assert segment["battery_state_out"]["system_charge_pct"] == 0.0
+
+
+class TestMultiSegmentEmission:
+    """When ``armed_field_seen`` is True, the payload builder switches off
+    the legacy "one synthetic segment per session" fallback and emits one
+    FLIGHT_SEGMENT event per recorded ``state.segments`` entry."""
+
+    def test_armed_seen_no_segments_emits_zero_flight_segments(self):
+        """Drone reported state but never armed = no flight happened.
+        Truthful answer is zero FLIGHT_SEGMENT events.
+        """
+        state = _make_drone_state()
+        state.armed_field_seen = True
+        # state.segments is the default empty list
+
+        payload = build_finalization_payload(state)
+        segments = [ev for ev in payload["events"] if ev["type"] == "FLIGHT_SEGMENT"]
+        assert segments == []
+
+    def test_one_closed_segment_emits_one_event(self):
+        state = _make_drone_state()
+        state.armed_field_seen = True
+        state.segments = [
+            FlightSegment(
+                time_in_utc="2026-03-09T18:05:00+00:00",
+                time_out_utc="2026-03-09T18:41:00+00:00",
+                voltage_in=24.8,
+                voltage_out=23.9,
+            )
+        ]
+
+        payload = build_finalization_payload(state)
+        segments = [ev for ev in payload["events"] if ev["type"] == "FLIGHT_SEGMENT"]
+        assert len(segments) == 1
+        assert segments[0]["time_in_utc"] == "2026-03-09T18:05:00Z"
+        assert segments[0]["time_out_utc"] == "2026-03-09T18:41:00Z"
+        assert segments[0]["battery_state_in"]["slots"][0]["voltage_v"] == 24.8
+        assert segments[0]["battery_state_out"]["slots"][0]["voltage_v"] == 23.9
+
+    def test_multiple_segments_emit_one_event_each_in_order(self):
+        state = _make_drone_state()
+        state.armed_field_seen = True
+        state.segments = [
+            FlightSegment(
+                time_in_utc="2026-03-09T18:00:00+00:00",
+                time_out_utc="2026-03-09T18:30:00+00:00",
+                voltage_in=24.8,
+                voltage_out=22.5,
+            ),
+            FlightSegment(
+                time_in_utc="2026-03-09T19:00:00+00:00",
+                time_out_utc="2026-03-09T19:30:00+00:00",
+                voltage_in=24.7,
+                voltage_out=22.6,
+            ),
+            FlightSegment(
+                time_in_utc="2026-03-09T20:00:00+00:00",
+                time_out_utc="2026-03-09T20:25:00+00:00",
+                voltage_in=24.6,
+                voltage_out=22.4,
+            ),
+        ]
+
+        payload = build_finalization_payload(state)
+        segments = [ev for ev in payload["events"] if ev["type"] == "FLIGHT_SEGMENT"]
+        assert len(segments) == 3
+        assert [s["time_in_utc"] for s in segments] == [
+            "2026-03-09T18:00:00Z",
+            "2026-03-09T19:00:00Z",
+            "2026-03-09T20:00:00Z",
+        ]
+        assert [s["battery_state_in"]["slots"][0]["voltage_v"] for s in segments] == [
+            24.8, 24.7, 24.6,
+        ]
+
+    def test_open_segment_auto_closed_at_session_last_seen(self):
+        """Drone disconnects mid-flight (no clean disarm).  The builder
+        must auto-close the still-open segment at state.last_seen so the
+        SADE payload still satisfies the contract."""
+        state = _make_drone_state(last_seen="2026-03-09T18:55:00+00:00")
+        state.armed_field_seen = True
+        state.segments = [
+            FlightSegment(
+                time_in_utc="2026-03-09T18:30:00+00:00",
+                time_out_utc=None,                       # still open!
+                voltage_in=24.8,
+                voltage_out=22.0,
+            )
+        ]
+
+        payload = build_finalization_payload(state)
+        seg = _first_flight_segment(payload)
+        assert seg["time_in_utc"] == "2026-03-09T18:30:00Z"
+        assert seg["time_out_utc"] == "2026-03-09T18:55:00Z"  # state.last_seen
+
+    def test_session_voltage_ignored_when_segments_present(self):
+        """Per-segment voltages take precedence over session-level voltage_in/out
+        in the modern path.  This is the load-bearing difference between the
+        two emission paths — the session totals are only a fallback."""
+        state = _make_drone_state(voltage_in=99.0, voltage_out=88.0)
+        state.armed_field_seen = True
+        state.segments = [
+            FlightSegment(
+                time_in_utc="2026-03-09T18:00:00+00:00",
+                time_out_utc="2026-03-09T18:30:00+00:00",
+                voltage_in=24.8,
+                voltage_out=22.5,
+            )
+        ]
+
+        seg = _first_flight_segment(build_finalization_payload(state))
+        assert seg["battery_state_in"]["slots"][0]["voltage_v"] == 24.8
+        assert seg["battery_state_out"]["slots"][0]["voltage_v"] == 22.5
+
+    def test_legacy_fallback_when_armed_field_never_seen(self):
+        """armed_field_seen=False → exactly one synthetic segment from
+        first_seen→last_seen using session-level voltages.  Identical to
+        pre-multi-segment behaviour."""
+        state = _make_drone_state(
+            first_seen="2026-03-09T18:00:00+00:00",
+            last_seen="2026-03-09T18:45:00+00:00",
+            voltage_in=24.8,
+            voltage_out=22.5,
+        )
+        # state.armed_field_seen defaults to False; state.segments is empty.
+
+        payload = build_finalization_payload(state)
+        segments = [ev for ev in payload["events"] if ev["type"] == "FLIGHT_SEGMENT"]
+        assert len(segments) == 1
+        assert segments[0]["time_in_utc"] == "2026-03-09T18:00:00Z"
+        assert segments[0]["time_out_utc"] == "2026-03-09T18:45:00Z"
+        assert segments[0]["battery_state_in"]["slots"][0]["voltage_v"] == 24.8
+        assert segments[0]["battery_state_out"]["slots"][0]["voltage_v"] == 22.5
+
+    def test_multi_segment_with_exit_request_orders_correctly(self):
+        """FLIGHT_SEGMENT events come first; EXIT_REQUEST appears after,
+        regardless of how many segments preceded it."""
+        state = _make_drone_state(
+            exit_requested_at="2026-03-09T19:35:00+00:00",
+            exit_reason="drone_left_early",
+        )
+        state.armed_field_seen = True
+        state.segments = [
+            FlightSegment(
+                time_in_utc="2026-03-09T18:00:00+00:00",
+                time_out_utc="2026-03-09T18:30:00+00:00",
+                voltage_in=24.8, voltage_out=22.5,
+            ),
+            FlightSegment(
+                time_in_utc="2026-03-09T19:00:00+00:00",
+                time_out_utc="2026-03-09T19:30:00+00:00",
+                voltage_in=24.7, voltage_out=22.6,
+            ),
+        ]
+
+        payload = build_finalization_payload(state)
+        types = [ev["type"] for ev in payload["events"]]
+        assert types == ["FLIGHT_SEGMENT", "FLIGHT_SEGMENT", "EXIT_REQUEST"]
 
 
 class TestExitRequestEvent:

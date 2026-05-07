@@ -8,6 +8,7 @@ import pytest
 
 from app.ingestion.workers import (
     TERMINAL_MISSION_STATUSES,
+    _extract_armed,
     _extract_drone_id,
     _extract_mode,
     _extract_mission_status,
@@ -161,6 +162,39 @@ class TestExtractMode:
         assert _extract_mode({}) is None
 
 
+# ── _extract_armed() ─────────────────────────────────────────────────────────
+
+
+class TestExtractArmed:
+    """status.armed is the authoritative arm-state signal — only literal
+    bools are accepted so a malformed message can't accidentally open or
+    close a flight segment."""
+
+    def test_armed_true(self):
+        assert _extract_armed({"status": {"armed": True}}) is True
+
+    def test_armed_false(self):
+        assert _extract_armed({"status": {"armed": False}}) is False
+
+    def test_missing_status(self):
+        assert _extract_armed({}) is None
+
+    def test_missing_armed_field(self):
+        assert _extract_armed({"status": {"mode": "AUTO"}}) is None
+
+    def test_armed_explicitly_null(self):
+        assert _extract_armed({"status": {"armed": None}}) is None
+
+    def test_status_not_dict(self):
+        assert _extract_armed({"status": "STANDBY"}) is None
+
+    @pytest.mark.parametrize("non_bool", [1, 0, "true", "ARMED", [], {}])
+    def test_non_bool_value_treated_as_absent(self, non_bool):
+        """0 / 1 / 'true' must NOT be treated as True, even though Python
+        considers them truthy.  We only trust literal True/False."""
+        assert _extract_armed({"status": {"armed": non_bool}}) is None
+
+
 # ── _is_terminal_mission_status() ────────────────────────────────────────────
 
 
@@ -233,7 +267,15 @@ class TestParseQueueMessage:
         assert result["mission_status"] is None
         assert result["mode"] is None
         assert result["position"] is None
+        assert result["armed"] is None
         assert result["payload"] == {}
+
+    def test_armed_field_surfaced(self):
+        """parse_queue_message must include 'armed' so the worker can
+        thread it into state_tracker.update for FLIGHT_SEGMENT detection."""
+        message = _wrap_payload({"uavid": "drone-01", "status": {"armed": True}})
+        result = parse_queue_message(message)
+        assert result["armed"] is True
 
 
 # ── _resolve_active_session() ────────────────────────────────────────────────

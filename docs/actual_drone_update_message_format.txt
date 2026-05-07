@@ -70,18 +70,21 @@ Fields currently consumed by parse_queue_message / state_tracker:
                                         first_seen / last_seen with its own
                                         receipt wall-clock
 
+Fields now consumed by the FLIGHT_SEGMENT detection path:
+
+  status.armed                       -> AUTHORITATIVE ARM STATE.  Read by
+                                        _extract_armed() in workers.py
+                                        and threaded into
+                                        state_tracker.update() via the
+                                        ``armed`` kwarg.  False/None → True
+                                        opens a new FlightSegment;
+                                        True → False closes it.  See
+                                        DroneState.segments and
+                                        build_finalization_payload's
+                                        per-segment emission path.
+
 Fields present on the wire but not yet consumed:
 
-  status.armed                       -> AUTHORITATIVE ARM STATE for future
-                                        FLIGHT_SEGMENT detection. This is
-                                        what the arm/disarm-based segment
-                                        detection plan needs — NO firmware
-                                        change required. Just wire up an
-                                        _extract_armed() reader in
-                                        state_tracker.update() and use it
-                                        to open/close segments. Proposed
-                                        "status.flight_state" is already
-                                        present as status.armed (bool).
   status.battery.level               -> Candidate for system_charge_pct.
                                         Currently placeholder 0.0 in the
                                         finalization payload — if "level"
@@ -119,11 +122,12 @@ status.status for mission lifecycle. Values observed on the wire so far:
 
 The current worker.py terminal-status set (mission_completed, complete,
 done, ...) presumably maps to some value of status.status in real
-telemetry. Confirm with the firmware team what the terminal / landed /
-mission-done value actually is — we shouldn't assume the simulator's
-"mission_completed" string is what real drones emit. The cleanest fix
-once we know: extend the terminal-status set or migrate to
-status.armed == false + status.status in a known "landed" set.
+telemetry, but its only remaining purpose is the local CSV diagnostic
+row — terminal MQTT no longer closes a session.  FLIGHT_SEGMENT
+detection has migrated to status.armed; the terminal-status string set
+is informational only.  Still worth confirming with the firmware team
+what landed/mission-done value real drones emit so the CSV stays
+accurate, but it's no longer load-bearing for finalization.
 
 
 Additional real samples (multiple drones in the fleet)

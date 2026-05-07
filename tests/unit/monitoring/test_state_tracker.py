@@ -19,14 +19,21 @@ def _make_position(lat: float = 39.77, lon: float = -86.16, alt: float = 100.0) 
     return {"latitude": lat, "longitude": lon, "altitude": alt}
 
 
-def _make_payload(*, voltage: float | None = None, altitude: float | None = None) -> dict:
-    """Build a minimal telemetry payload with optional nested voltage/altitude."""
+def _make_payload(
+    *,
+    voltage: float | None = None,
+    altitude: float | None = None,
+    armed: bool | None = None,
+) -> dict:
+    """Build a minimal telemetry payload with optional nested voltage/altitude/armed."""
     payload: dict = {}
     status: dict = {}
     if voltage is not None:
         status["battery"] = {"voltage": voltage}
     if altitude is not None:
         status["location"] = {"altitude": altitude}
+    if armed is not None:
+        status["armed"] = armed
     if status:
         payload["status"] = status
     return payload
@@ -43,9 +50,10 @@ def _do_update(
     position: dict | None = None,
     last_seen: str | None = "2026-01-01T00:00:00Z",
     voltage: float | None = None,
+    armed: bool | None = None,
 ) -> DroneState:
     """Shorthand for a tracker.update() call with sensible defaults."""
-    payload = _make_payload(voltage=voltage)
+    payload = _make_payload(voltage=voltage, armed=armed)
     return tracker.update(
         flight_session_id,
         drone_id=drone_id,
@@ -55,6 +63,7 @@ def _do_update(
         mission_status=mission_status,
         mode=mode,
         position=position,
+        armed=armed,
         last_seen=last_seen,
     )
 
@@ -397,3 +406,115 @@ class TestSafeFloat:
 
     def test_invalid_string(self):
         assert _safe_float("abc") is None
+
+
+# ── Arm-state segment detection ──────────────────────────────────────────────
+
+
+class TestArmStateDetection:
+    """status.armed transitions open and close FlightSegments on the
+    DroneState's segments list.  ``armed_field_seen`` tracks whether the
+    firmware ever emitted the field at all (used by the payload builder
+    to choose between per-segment emission and the legacy fallback)."""
+
+    def test_no_armed_field_keeps_legacy_path(self):
+        """Drone telemetry with no armed field never opens segments and
+        leaves armed_field_seen=False (legacy firmware behaviour)."""
+        tracker = DroneStateTracker()
+        for _ in range(3):
+            state = _do_update(tracker, voltage=16.0)
+        assert state.segments == []
+        assert state.last_armed is None
+        assert state.armed_field_seen is False
+
+    def test_first_message_armed_false_does_not_open_segment(self):
+        """Drone reporting armed=False at session start = on the ground.
+        No segment opens; armed_field_seen flips True."""
+        tracker = DroneStateTracker()
+        state = _do_update(tracker, armed=False, voltage=16.0)
+        assert state.segments == []
+        assert state.last_armed is False
+        assert state.armed_field_seen is True
+
+    def test_first_message_armed_true_opens_segment(self):
+        tracker = DroneStateTracker()
+        state = _do_update(tracker, armed=True, voltage=16.4, last_seen="2026-03-09T18:05:00Z")
+        assert len(state.segments) == 1
+        assert state.segments[0].time_in_utc == "2026-03-09T18:05:00Z"
+        assert state.segments[0].time_out_utc is None  # still open
+        assert state.segments[0].voltage_in == 16.4
+        assert state.last_armed is True
+        assert state.armed_field_seen is True
+
+    def test_arm_then_disarm_closes_segment(self):
+        tracker = DroneStateTracker()
+        _do_update(tracker, armed=True, voltage=16.4, last_seen="2026-03-09T18:05:00Z")
+        state = _do_update(
+            tracker,
+            armed=False, voltage=14.9, last_seen="2026-03-09T18:41:00Z",
+        )
+        assert len(state.segments) == 1
+        seg = state.segments[0]
+        assert seg.time_in_utc == "2026-03-09T18:05:00Z"
+        assert seg.time_out_utc == "2026-03-09T18:41:00Z"
+        assert seg.voltage_in == 16.4
+        assert seg.voltage_out == 14.9
+        assert state.last_armed is False
+
+    def test_arm_disarm_arm_creates_two_segments(self):
+        tracker = DroneStateTracker()
+        _do_update(tracker, armed=True, voltage=16.5, last_seen="2026-03-09T18:00:00Z")
+        _do_update(tracker, armed=False, voltage=14.9, last_seen="2026-03-09T18:30:00Z")
+        _do_update(tracker, armed=True, voltage=16.6, last_seen="2026-03-09T19:00:00Z")
+        state = _do_update(
+            tracker, armed=False, voltage=15.1,
+            last_seen="2026-03-09T19:30:00Z",
+        )
+        assert len(state.segments) == 2
+        assert state.segments[0].time_in_utc == "2026-03-09T18:00:00Z"
+        assert state.segments[0].time_out_utc == "2026-03-09T18:30:00Z"
+        assert state.segments[1].time_in_utc == "2026-03-09T19:00:00Z"
+        assert state.segments[1].time_out_utc == "2026-03-09T19:30:00Z"
+
+    def test_voltage_out_tracks_latest_during_segment(self):
+        """While armed, the open segment's voltage_out updates on every
+        message so that even if the disarm message has no voltage data,
+        we still record a useful out-value."""
+        tracker = DroneStateTracker()
+        _do_update(tracker, armed=True, voltage=16.5, last_seen="2026-03-09T18:00:00Z")
+        _do_update(tracker, armed=True, voltage=15.8, last_seen="2026-03-09T18:10:00Z")
+        state = _do_update(
+            tracker, armed=True, voltage=15.2, last_seen="2026-03-09T18:20:00Z",
+        )
+        assert state.segments[0].voltage_in == 16.5
+        assert state.segments[0].voltage_out == 15.2
+
+    def test_repeated_armed_true_does_not_open_new_segment(self):
+        """While armed, subsequent armed=True messages don't open new segments."""
+        tracker = DroneStateTracker()
+        for ts in ("2026-03-09T18:00:00Z", "2026-03-09T18:01:00Z", "2026-03-09T18:02:00Z"):
+            state = _do_update(tracker, armed=True, voltage=16.0, last_seen=ts)
+        assert len(state.segments) == 1
+
+    def test_repeated_armed_false_does_not_close_a_closed_segment(self):
+        """After disarm, more armed=False messages are no-ops."""
+        tracker = DroneStateTracker()
+        _do_update(tracker, armed=True, voltage=16.0, last_seen="2026-03-09T18:00:00Z")
+        _do_update(tracker, armed=False, voltage=14.9, last_seen="2026-03-09T18:30:00Z")
+        state = _do_update(tracker, armed=False, voltage=14.8, last_seen="2026-03-09T18:31:00Z")
+        assert len(state.segments) == 1
+        # The original time_out_utc must persist — second disarm doesn't
+        # overwrite it.
+        assert state.segments[0].time_out_utc == "2026-03-09T18:30:00Z"
+
+    def test_armed_field_seen_persists_across_subsequent_messages_without_field(self):
+        """Once the firmware reports the field, even one message without it
+        doesn't reset the flag.  Otherwise a transient malformed message
+        could collapse the session back to the legacy path."""
+        tracker = DroneStateTracker()
+        _do_update(tracker, armed=True, voltage=16.0, last_seen="2026-03-09T18:00:00Z")
+        # Simulate a message that lacks status.armed (extractor returns None).
+        state = _do_update(tracker, armed=None, voltage=15.5, last_seen="2026-03-09T18:01:00Z")
+        assert state.armed_field_seen is True
+        # The open segment is still open — None is a no-op, not a disarm.
+        assert state.segments[0].time_out_utc is None

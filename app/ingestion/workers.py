@@ -75,6 +75,23 @@ def _extract_mission_status(payload: dict[str, Any]) -> Any:
     return payload.get("mission_status", status.get("status"))
 
 
+def _extract_armed(payload: dict[str, Any]) -> bool | None:
+    """Return ``status.armed`` as a bool, or None when absent / not boolean.
+
+    The arm-state field is the authoritative signal for FLIGHT_SEGMENT
+    detection (see docs/actual_drone_update_message_format.txt).  Real
+    captures show it as a JSON boolean under the nested ``status`` object;
+    we accept only literal ``True``/``False`` and treat anything else
+    (missing field, ``None``, string, number) as "not present" so a
+    malformed message can't accidentally open or close a segment.
+    """
+    status = payload.get("status") if isinstance(payload.get("status"), dict) else {}
+    value = status.get("armed")
+    if isinstance(value, bool):
+        return value
+    return None
+
+
 def _extract_mode(payload: dict[str, Any]) -> Any:
     """Extract best-effort mode field from payload."""
     status = payload.get("status") if isinstance(payload.get("status"), dict) else {}
@@ -106,6 +123,7 @@ def parse_queue_message(message: dict[str, Any]) -> dict[str, Any]:
     mission_status = _extract_mission_status(payload)
     mode = _extract_mode(payload)
     position = _extract_position(payload)
+    armed = _extract_armed(payload)
 
     return {
         "drone_id": drone_id,
@@ -113,6 +131,7 @@ def parse_queue_message(message: dict[str, Any]) -> dict[str, Any]:
         "mission_status": mission_status,
         "mode": mode,
         "position": position,
+        "armed": armed,
     }
 
 
@@ -202,6 +221,7 @@ async def telemetry_worker(
                 mission_status=parsed["mission_status"],
                 mode=parsed["mode"],
                 position=parsed["position"],
+                armed=parsed["armed"],
                 last_seen=last_seen,
             )
 
