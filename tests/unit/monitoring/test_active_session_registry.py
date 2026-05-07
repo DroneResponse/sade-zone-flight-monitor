@@ -290,3 +290,86 @@ class TestSnapshotAndCount:
         snap.pop("flight-001")
         # Modifying snapshot should not affect the registry
         assert reg.get_by_flight_session_id("flight-001") is not None
+
+
+# ── Deadline-breach tracking ─────────────────────────────────────────────────
+
+
+class TestDeadlineFields:
+    def test_default_field_values(self):
+        """The new sweeper-related fields default to None."""
+        session = ActiveFlightSession(flight_session_id="flight-001")
+
+        assert session.exit_requested_at is None
+        assert session.exit_deadline_breached_at is None
+
+    def test_fields_can_be_set(self):
+        session = ActiveFlightSession(
+            flight_session_id="flight-001",
+            exit_requested_at="2026-03-09T19:00:00+00:00",
+            exit_deadline_breached_at="2026-03-09T19:05:00+00:00",
+        )
+
+        assert session.exit_requested_at == "2026-03-09T19:00:00+00:00"
+        assert session.exit_deadline_breached_at == "2026-03-09T19:05:00+00:00"
+
+
+class TestCountPastDeadline:
+    def test_empty_registry(self):
+        reg = ActiveSessionRegistry()
+        assert reg.count_past_deadline() == 0
+
+    def test_no_sessions_flagged(self):
+        reg = ActiveSessionRegistry()
+        reg.register(_make_session("flight-A", drone_id="drone-A"))
+        reg.register(_make_session("flight-B", drone_id="drone-B"))
+
+        assert reg.count_past_deadline() == 0
+
+    def test_one_session_flagged(self):
+        reg = ActiveSessionRegistry()
+        reg.register(_make_session("flight-A", drone_id="drone-A"))
+        flagged = _make_session(
+            "flight-B",
+            drone_id="drone-B",
+            exit_deadline_breached_at="2026-03-09T19:05:00+00:00",
+        )
+        reg.register(flagged)
+
+        assert reg.count_past_deadline() == 1
+
+    def test_mixed_set_and_unset(self):
+        reg = ActiveSessionRegistry()
+        for i in range(3):
+            reg.register(
+                _make_session(
+                    f"flight-flagged-{i}",
+                    drone_id=f"drone-flagged-{i}",
+                    exit_deadline_breached_at="2026-03-09T19:05:00+00:00",
+                )
+            )
+        for i in range(2):
+            reg.register(
+                _make_session(
+                    f"flight-clean-{i}",
+                    drone_id=f"drone-clean-{i}",
+                )
+            )
+
+        assert reg.count_past_deadline() == 3
+        assert reg.count() == 5
+
+    def test_count_drops_when_session_completes(self):
+        """Completing a flagged session removes it from the past-deadline count."""
+        reg = ActiveSessionRegistry()
+        reg.register(
+            _make_session(
+                "flight-A",
+                drone_id="drone-A",
+                exit_deadline_breached_at="2026-03-09T19:05:00+00:00",
+            )
+        )
+        assert reg.count_past_deadline() == 1
+
+        reg.complete("flight-A")
+        assert reg.count_past_deadline() == 0

@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import JSONResponse
@@ -45,6 +47,7 @@ LOGGER = logging.getLogger(__name__)
 STUB_FINALIZATION_DELAY_SECONDS = 5.0
 EXIT_GRACE_PERIOD_SECONDS = 300.0  # 5 minutes of telemetry silence before finalizing
 EXIT_GRACE_CHECK_INTERVAL_SECONDS = 30.0  # how often to check for new telemetry
+SWEEPER_INTERVAL_SECONDS = 60.0  # how often the periodic sweeper scans the registry
 
 # ── Shared state ─────────────────────────────────────────────────────────────
 # These module-level instances are the single source of truth for active
@@ -53,6 +56,112 @@ EXIT_GRACE_CHECK_INTERVAL_SECONDS = 30.0  # how often to check for new telemetry
 #   from app.api.server import registry, state_tracker
 registry: ActiveSessionRegistry = ActiveSessionRegistry()
 state_tracker: DroneStateTracker = DroneStateTracker()
+
+
+# ── Periodic session sweeper ─────────────────────────────────────────────────
+# Background coroutine that scans the registry every SWEEPER_INTERVAL_SECONDS
+# looking for sessions whose ``requested_exit_time`` has passed without a
+# corresponding exit-request from SADE.  Flagged sessions are stamped with
+# ``exit_deadline_breached_at`` (one-shot edge detector) and surfaced via
+# /health for observability.  No auto-finalize today — flag-and-observe only.
+
+
+def _scan_for_deadline_breaches(reg: ActiveSessionRegistry) -> int:
+    """One sweep iteration: flag sessions past requested_exit_time.
+
+    Returns the number of sessions newly flagged on this pass (zero when
+    nothing changed).  Pulled out of the async loop so it can be unit
+    tested without dealing with asyncio.sleep / mocked clocks.
+
+    Skipped for sessions where:
+    - ``exit_deadline_breached_at`` is already set (one-shot).
+    - ``requested_exit_time`` is unset (SADE didn't supply a deadline).
+    - ``exit_requested_at`` is set (SADE has already closed it out).
+    - ``requested_exit_time`` doesn't parse as ISO 8601 (logged once;
+      better to skip than crash the sweeper for one bad record).
+    - ``now <= requested_exit_time`` (still within the authorized window).
+    """
+    now_dt = datetime.now(timezone.utc)
+    now_iso = now_dt.isoformat()
+    newly_flagged = 0
+
+    for session in list(reg.snapshot().values()):
+        if session.exit_deadline_breached_at is not None:
+            continue
+        if not session.requested_exit_time:
+            continue
+        if session.exit_requested_at is not None:
+            continue
+
+        try:
+            deadline_dt = datetime.fromisoformat(session.requested_exit_time)
+        except (TypeError, ValueError):
+            LOGGER.warning(
+                "Skipping deadline-breach check for session with unparseable "
+                "requested_exit_time. flight_session_id=%s value=%r",
+                session.flight_session_id,
+                session.requested_exit_time,
+            )
+            continue
+
+        # SADE sends UTC ISO timestamps with offset/Z, but be defensive:
+        # treat any naive datetime as UTC rather than crashing on compare.
+        if deadline_dt.tzinfo is None:
+            deadline_dt = deadline_dt.replace(tzinfo=timezone.utc)
+
+        if now_dt <= deadline_dt:
+            continue
+
+        session.exit_deadline_breached_at = now_iso
+        newly_flagged += 1
+        LOGGER.warning(
+            "Session past requested_exit_time without exit-request. "
+            "flight_session_id=%s drone_id=%s requested_exit_time=%s now=%s",
+            session.flight_session_id,
+            session.drone_id,
+            session.requested_exit_time,
+            now_iso,
+        )
+
+    return newly_flagged
+
+
+async def _run_session_sweeper(reg: ActiveSessionRegistry) -> None:
+    """Periodically scan the registry for deadline breaches.
+
+    Runs forever until cancelled (typically by the FastAPI lifespan
+    shutdown hook).  An exception inside one iteration is logged but
+    does not stop the loop — a stuck registry shouldn't take the whole
+    sweeper down.
+    """
+    LOGGER.info(
+        "Session sweeper started: interval=%.0fs",
+        SWEEPER_INTERVAL_SECONDS,
+    )
+    try:
+        while True:
+            await asyncio.sleep(SWEEPER_INTERVAL_SECONDS)
+            try:
+                _scan_for_deadline_breaches(reg)
+            except Exception:  # noqa: BLE001
+                LOGGER.exception("Session sweeper iteration failed")
+    except asyncio.CancelledError:
+        LOGGER.info("Session sweeper stopped")
+        raise
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """FastAPI lifespan: spawn the session sweeper on startup, cancel on shutdown."""
+    sweeper_task = asyncio.create_task(
+        _run_session_sweeper(registry),
+        name="session-sweeper",
+    )
+    try:
+        yield
+    finally:
+        sweeper_task.cancel()
+        await asyncio.gather(sweeper_task, return_exceptions=True)
 
 
 # ── FastAPI app ──────────────────────────────────────────────────────────────
@@ -67,6 +176,7 @@ app = FastAPI(
         "activates drone telemetry monitoring in the pipeline."
     ),
     version="2.0.0",
+    lifespan=_lifespan,
 )
 
 
@@ -196,8 +306,6 @@ async def _run_exit_grace_period(
     finalized it because the drone sent a terminal MQTT status), this task
     exits cleanly.
     """
-    from datetime import datetime, timezone
-
     LOGGER.info(
         "Exit grace period started: flight_session_id=%s drone_id=%s "
         "silence_threshold=%.0fs check_interval=%.0fs",
@@ -367,8 +475,9 @@ async def exit_request(
 
 @app.get("/health", summary="Liveness check")
 async def health(reg: ActiveSessionRegistry = Depends(get_registry)) -> dict:
-    """Return server status and current active session count."""
+    """Return server status, active-session counts, and deadline-breach counter."""
     return {
         "status": "ok",
         "active_sessions": reg.count(),
+        "sessions_past_deadline": reg.count_past_deadline(),
     }

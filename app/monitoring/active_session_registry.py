@@ -45,6 +45,16 @@ class ActiveFlightSession:
     submitted_at: str | None = None
     source_payload: dict[str, Any] = field(default_factory=dict)
     registered_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    # Set when SADE sends /flight-monitor/exit-request.  Mirrors the same
+    # field on DroneState but lives on the session record so the sweeper
+    # has a single source of truth even when no telemetry has arrived
+    # (in which case DroneState doesn't exist yet).
+    exit_requested_at: str | None = None
+    # Stamped by the periodic sweeper the first time it observes that
+    # ``now > requested_exit_time`` and ``exit_requested_at is None``.
+    # Acts as a one-shot edge detector — once set, the session is not
+    # re-flagged on subsequent sweeps.
+    exit_deadline_breached_at: str | None = None
 
 
 class ActiveSessionRegistry:
@@ -135,3 +145,16 @@ class ActiveSessionRegistry:
     def count(self) -> int:
         """Return the number of active sessions currently tracked."""
         return len(self._sessions_by_flight_session_id)
+
+    def count_past_deadline(self) -> int:
+        """Return how many active sessions have been flagged past their deadline.
+
+        Counts sessions whose ``exit_deadline_breached_at`` field has been
+        stamped by the periodic sweeper.  O(N) over the active session set,
+        which is expected to stay small (low tens at most) — no caching.
+        """
+        return sum(
+            1
+            for session in self._sessions_by_flight_session_id.values()
+            if session.exit_deadline_breached_at is not None
+        )

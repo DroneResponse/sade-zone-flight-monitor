@@ -82,11 +82,19 @@ def process_exit_request(
             "message": "No active session found for this flight_session_id.",
         }
 
+    # Stamp the exit-request timestamp on the session record itself.  This
+    # is the canonical signal the periodic sweeper uses to know "SADE has
+    # closed out this session" — the equivalent field on DroneState only
+    # exists once telemetry has arrived, so it's not reliable for sessions
+    # the sweeper sees before any update_drone message lands.  Only set
+    # once — a retried exit shouldn't overwrite the original intent.
+    if session.exit_requested_at is None:
+        session.exit_requested_at = requested_at
+
     current_state = state_tracker.get(flight_session_id)
     if current_state is not None:
-        # Stamp exit intent onto the session's live state so the eventual
-        # finalization payload can emit an EXIT_REQUEST event.  Only set
-        # once — a retried exit shouldn't overwrite the original intent.
+        # Mirror the stamp onto live state so the eventual finalization
+        # payload can emit an EXIT_REQUEST event.  Only set once.
         if current_state.exit_requested_at is None:
             current_state.exit_requested_at = requested_at
             current_state.exit_reason = reason

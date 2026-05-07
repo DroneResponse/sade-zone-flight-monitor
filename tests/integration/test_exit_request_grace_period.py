@@ -24,6 +24,10 @@ Scenarios tested:
   5. Telemetry then silence — register, exit, simulate telemetry mid-grace,
      verify the silence clock resets so finalization is measured from when
      telemetry stopped, not from when the exit request arrived
+  6. Deadline breach flag — register a session with a near-future
+     requested_exit_time, wait past the deadline + sweeper interval,
+     verify /health.sessions_past_deadline increments and the session's
+     exit_deadline_breached_at field is stamped
 """
 
 from __future__ import annotations
@@ -46,6 +50,10 @@ LOGGER = logging.getLogger("run_exit_grace_period_test")
 # Shortened grace period for testing (real values: 300s / 30s).
 TEST_GRACE_PERIOD_SECONDS = 10.0
 TEST_GRACE_CHECK_INTERVAL_SECONDS = 3.0
+
+# Shortened sweeper interval so deadline-breach scenarios complete in
+# seconds rather than the production cadence (60s).
+TEST_SWEEPER_INTERVAL_SECONDS = 2.0
 
 # How long to wait after the grace period should have expired.
 GRACE_BUFFER_SECONDS = 5.0
@@ -84,9 +92,14 @@ async def _start_api_server(host: str, port: int) -> asyncio.Task:
     import uvicorn
     import app.api.server as srv
 
-    # Patch grace period constants for fast testing.
+    # Patch grace period and sweeper constants for fast testing.  The
+    # sweeper override has to happen before uvicorn boots the lifespan
+    # handler that spawns the sweeper task, otherwise the task would run
+    # at the production cadence (60s) and the deadline-breach scenario
+    # would time out.
     srv.EXIT_GRACE_PERIOD_SECONDS = TEST_GRACE_PERIOD_SECONDS
     srv.EXIT_GRACE_CHECK_INTERVAL_SECONDS = TEST_GRACE_CHECK_INTERVAL_SECONDS
+    srv.SWEEPER_INTERVAL_SECONDS = TEST_SWEEPER_INTERVAL_SECONDS
 
     config = uvicorn.Config(srv.app, host=host, port=port, log_level="warning")
     server = uvicorn.Server(config)
@@ -319,6 +332,90 @@ async def scenario_telemetry_then_silence(base_url: str) -> bool:
     return True
 
 
+async def scenario_deadline_breach_flag(base_url: str) -> bool:
+    """Scenario 6: Sweeper flags a session past requested_exit_time.
+
+    With test constants (sweeper=2s, deadline=now+3s):
+      * t=0  register session with requested_exit_time = now + 3s
+      * t=3  deadline elapses; sweeper hasn't fired yet (interval=2s)
+      * t=4  next sweeper tick (depending on phase) flags the session
+      * t=6  /health is queried — sessions_past_deadline must be 1
+              and the session's exit_deadline_breached_at is stamped
+
+    Sleeps 6s after registration to give the sweeper at least two ticks
+    past the deadline regardless of the initial timing phase.
+
+    Cleanup at the end uses ``registry.complete(fid)`` directly — same
+    pattern as scenario_natural_completion — to avoid waiting another
+    grace-period worth of time before the next scenario runs.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from app.api.server import registry
+
+    LOGGER.info("── Scenario 6: Deadline breach flag ──")
+
+    fid = f"deadline-breach-{uuid4()}"
+    drone_id = "drone-deadline"
+    deadline_iso = (datetime.now(timezone.utc) + timedelta(seconds=3)).isoformat()
+
+    status, body = await asyncio.to_thread(
+        _post_json,
+        f"{base_url}/flight-monitor/register-session",
+        {
+            "flight_session_id": fid,
+            "drone_id": drone_id,
+            "pilot_id": f"pilot-{drone_id}",
+            "requested_exit_time": deadline_iso,
+        },
+    )
+    if status != 202 or body.get("action") != "registered":
+        LOGGER.error("  FAIL: Registration failed (HTTP %s action=%s)", status, body.get("action"))
+        return False
+    LOGGER.info("  Registered with requested_exit_time=%s", deadline_iso)
+
+    # Wait past deadline + 2 sweeper intervals.  3s deadline + 2*2s sweeper
+    # cadence + 1s buffer = 8s.  This guarantees at least one sweep fires
+    # after the deadline regardless of initial phase.
+    wait = 8.0
+    LOGGER.info("  Waiting %.0fs for deadline to elapse and sweeper to flag...", wait)
+    await asyncio.sleep(wait)
+
+    health = await asyncio.to_thread(_get_json, f"{base_url}/health")
+    past_deadline = health.get("sessions_past_deadline", -1)
+    if past_deadline < 1:
+        LOGGER.error(
+            "  FAIL: Expected sessions_past_deadline >= 1, got %s. /health=%s",
+            past_deadline,
+            health,
+        )
+        registry.complete(fid)
+        return False
+
+    # The flagged session itself should carry the stamped timestamp.
+    session = registry.get_by_flight_session_id(fid)
+    if session is None or session.exit_deadline_breached_at is None:
+        LOGGER.error(
+            "  FAIL: Expected exit_deadline_breached_at to be stamped on the session. "
+            "session=%s breach_field=%s",
+            session,
+            getattr(session, "exit_deadline_breached_at", None),
+        )
+        registry.complete(fid)
+        return False
+
+    LOGGER.info(
+        "  PASS: sessions_past_deadline=%d; flagged session "
+        "exit_deadline_breached_at=%s",
+        past_deadline,
+        session.exit_deadline_breached_at,
+    )
+
+    # Cleanup so the next scenario sees an empty registry.
+    registry.complete(fid)
+    return True
+
+
 async def scenario_multiple_exits(base_url: str) -> bool:
     """Scenario 4: Multiple grace periods run independently."""
     LOGGER.info("── Scenario 4: Multiple simultaneous exits ──")
@@ -384,6 +481,7 @@ async def run_test(args: argparse.Namespace) -> bool:
         results.append(("Natural completion", await scenario_natural_completion(base_url)))
         results.append(("Telemetry then silence", await scenario_telemetry_then_silence(base_url)))
         results.append(("Multiple exits", await scenario_multiple_exits(base_url)))
+        results.append(("Deadline breach flag", await scenario_deadline_breach_flag(base_url)))
     finally:
         api_task.cancel()
         await asyncio.gather(api_task, return_exceptions=True)
