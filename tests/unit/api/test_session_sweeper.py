@@ -16,11 +16,16 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from app.api.server import _scan_for_deadline_breaches
+from app.api.server import (
+    STRANDED_SILENCE_THRESHOLD_SECONDS,
+    _scan_for_deadline_breaches,
+    _scan_for_stranded_sessions,
+)
 from app.monitoring.active_session_registry import (
     ActiveFlightSession,
     ActiveSessionRegistry,
 )
+from app.monitoring.state_tracker import DroneStateTracker
 
 
 def _iso(dt: datetime) -> str:
@@ -34,6 +39,7 @@ def _make_session(
     requested_exit_time: str | None = None,
     exit_requested_at: str | None = None,
     exit_deadline_breached_at: str | None = None,
+    stranded_flagged_at: str | None = None,
 ) -> ActiveFlightSession:
     return ActiveFlightSession(
         flight_session_id=flight_session_id,
@@ -41,6 +47,29 @@ def _make_session(
         requested_exit_time=requested_exit_time,
         exit_requested_at=exit_requested_at,
         exit_deadline_breached_at=exit_deadline_breached_at,
+        stranded_flagged_at=stranded_flagged_at,
+    )
+
+
+def _populate_tracker(
+    tracker: DroneStateTracker,
+    flight_session_id: str,
+    last_seen: str,
+    *,
+    drone_id: str | None = None,
+) -> None:
+    """Inject one telemetry update so the session has a DroneState with the
+    given last_seen timestamp.  Mirrors what the worker does in production."""
+    tracker.update(
+        flight_session_id,
+        drone_id=drone_id or f"drone-{flight_session_id}",
+        session_source="aws",
+        raw_message={},
+        parsed_payload={},
+        mission_status=None,
+        mode=None,
+        position=None,
+        last_seen=last_seen,
     )
 
 
@@ -202,5 +231,225 @@ class TestCounterIntegration:
         first_count = reg.count_past_deadline()
         _scan_for_deadline_breaches(reg)
         second_count = reg.count_past_deadline()
+
+        assert first_count == second_count == 1
+
+
+# ── _scan_for_stranded_sessions ──────────────────────────────────────────────
+#
+# Stranded means: drone was transmitting (DroneState exists), it has now been
+# silent for longer than STRANDED_SILENCE_THRESHOLD_SECONDS, and SADE has not
+# sent an exit-request.
+
+
+def _silent_for(seconds: float) -> str:
+    """Return an ISO timestamp that's ``seconds`` in the past."""
+    return _iso(datetime.now(timezone.utc) - timedelta(seconds=seconds))
+
+
+class TestStrandedNoFlagging:
+    def test_empty_registry(self):
+        reg = ActiveSessionRegistry()
+        tracker = DroneStateTracker()
+
+        assert _scan_for_stranded_sessions(reg, tracker) == 0
+
+    def test_session_with_no_telemetry(self):
+        """No DroneState exists yet — explicitly NOT a stranded case
+        (could be a drone that just hasn't taken off).  Deadline-breach
+        detector handles 'never showed up' via requested_exit_time."""
+        reg = ActiveSessionRegistry()
+        reg.register(_make_session("flight-1"))
+        tracker = DroneStateTracker()  # empty
+
+        assert _scan_for_stranded_sessions(reg, tracker) == 0
+        assert reg.get_by_flight_session_id("flight-1").stranded_flagged_at is None
+
+    def test_session_with_recent_telemetry(self):
+        """Telemetry just arrived — not silent yet."""
+        reg = ActiveSessionRegistry()
+        reg.register(_make_session("flight-1"))
+        tracker = DroneStateTracker()
+        _populate_tracker(tracker, "flight-1", _silent_for(10.0))
+
+        assert _scan_for_stranded_sessions(reg, tracker) == 0
+
+    def test_session_silent_just_under_threshold(self):
+        """Silence below threshold doesn't flag (strict comparison)."""
+        reg = ActiveSessionRegistry()
+        reg.register(_make_session("flight-1"))
+        tracker = DroneStateTracker()
+        _populate_tracker(
+            tracker, "flight-1",
+            _silent_for(STRANDED_SILENCE_THRESHOLD_SECONDS - 1.0),
+        )
+
+        assert _scan_for_stranded_sessions(reg, tracker) == 0
+
+
+class TestStrandedFlagging:
+    def test_session_silent_past_threshold(self):
+        """Canonical case: drone was transmitting, hasn't said anything in
+        longer than the silence threshold, no exit-request received."""
+        reg = ActiveSessionRegistry()
+        reg.register(_make_session("flight-1"))
+        tracker = DroneStateTracker()
+        _populate_tracker(
+            tracker, "flight-1",
+            _silent_for(STRANDED_SILENCE_THRESHOLD_SECONDS + 30.0),
+        )
+
+        assert _scan_for_stranded_sessions(reg, tracker) == 1
+
+        session = reg.get_by_flight_session_id("flight-1")
+        assert session.stranded_flagged_at is not None
+        # Stamped value should be a valid UTC ISO timestamp.
+        stamped = datetime.fromisoformat(session.stranded_flagged_at)
+        assert stamped.tzinfo is not None
+
+    def test_multiple_sessions_some_silent_some_active(self):
+        reg = ActiveSessionRegistry()
+        reg.register(_make_session("silent-1"))
+        reg.register(_make_session("silent-2"))
+        reg.register(_make_session("active-1"))
+        reg.register(_make_session("nostate"))  # no DroneState at all
+        tracker = DroneStateTracker()
+        _populate_tracker(tracker, "silent-1", _silent_for(STRANDED_SILENCE_THRESHOLD_SECONDS + 60))
+        _populate_tracker(tracker, "silent-2", _silent_for(STRANDED_SILENCE_THRESHOLD_SECONDS + 60))
+        _populate_tracker(tracker, "active-1", _silent_for(5.0))
+
+        assert _scan_for_stranded_sessions(reg, tracker) == 2
+        assert reg.count_stranded() == 2
+
+        assert reg.get_by_flight_session_id("silent-1").stranded_flagged_at is not None
+        assert reg.get_by_flight_session_id("silent-2").stranded_flagged_at is not None
+        assert reg.get_by_flight_session_id("active-1").stranded_flagged_at is None
+        assert reg.get_by_flight_session_id("nostate").stranded_flagged_at is None
+
+
+class TestStrandedSkippedConditions:
+    def test_session_with_exit_request_already_set(self):
+        """SADE has already closed it — sweeper shouldn't second-guess.
+        Even if telemetry has gone silent past the threshold, the grace
+        task owns finalization in this case."""
+        reg = ActiveSessionRegistry()
+        reg.register(
+            _make_session(
+                "flight-1",
+                exit_requested_at="2026-03-09T19:00:00+00:00",
+            )
+        )
+        tracker = DroneStateTracker()
+        _populate_tracker(
+            tracker, "flight-1",
+            _silent_for(STRANDED_SILENCE_THRESHOLD_SECONDS + 60),
+        )
+
+        assert _scan_for_stranded_sessions(reg, tracker) == 0
+        assert reg.get_by_flight_session_id("flight-1").stranded_flagged_at is None
+
+    def test_already_flagged_session_not_reflagged(self):
+        """One-shot edge detector — original timestamp must persist."""
+        original_flag = "2026-03-09T19:10:00+00:00"
+        reg = ActiveSessionRegistry()
+        reg.register(_make_session("flight-1", stranded_flagged_at=original_flag))
+        tracker = DroneStateTracker()
+        _populate_tracker(
+            tracker, "flight-1",
+            _silent_for(STRANDED_SILENCE_THRESHOLD_SECONDS + 60),
+        )
+
+        for _ in range(5):
+            assert _scan_for_stranded_sessions(reg, tracker) == 0
+
+        assert reg.get_by_flight_session_id("flight-1").stranded_flagged_at == original_flag
+
+    def test_unparseable_last_seen_does_not_crash(self):
+        """A malformed timestamp on DroneState should be skipped.  Must not
+        prevent OTHER stranded sessions from being flagged on the same pass."""
+        reg = ActiveSessionRegistry()
+        reg.register(_make_session("bad-timestamp"))
+        reg.register(_make_session("good-stranded"))
+        tracker = DroneStateTracker()
+        _populate_tracker(tracker, "bad-timestamp", "not-a-date")
+        _populate_tracker(
+            tracker, "good-stranded",
+            _silent_for(STRANDED_SILENCE_THRESHOLD_SECONDS + 60),
+        )
+
+        assert _scan_for_stranded_sessions(reg, tracker) == 1
+        assert reg.get_by_flight_session_id("bad-timestamp").stranded_flagged_at is None
+        assert reg.get_by_flight_session_id("good-stranded").stranded_flagged_at is not None
+
+
+class TestStrandedNaiveTimestamps:
+    def test_naive_silent_treated_as_utc_flagged(self):
+        """A naive last_seen string is treated as UTC, not crashed on."""
+        naive_iso = (
+            datetime.now(timezone.utc)
+            - timedelta(seconds=STRANDED_SILENCE_THRESHOLD_SECONDS + 60)
+        ).replace(tzinfo=None).isoformat()
+        reg = ActiveSessionRegistry()
+        reg.register(_make_session("flight-1"))
+        tracker = DroneStateTracker()
+        _populate_tracker(tracker, "flight-1", naive_iso)
+
+        assert _scan_for_stranded_sessions(reg, tracker) == 1
+
+
+class TestBothFlagsCanFireOnSameSession:
+    """Deadline breach and stranded are independent signals.  A session
+    that's both past its deadline AND has gone silent past the threshold
+    must end up with BOTH flags set."""
+
+    def test_both_flags_set_independently(self):
+        past = datetime.now(timezone.utc) - timedelta(seconds=10)
+        reg = ActiveSessionRegistry()
+        reg.register(_make_session("flight-1", requested_exit_time=_iso(past)))
+        tracker = DroneStateTracker()
+        _populate_tracker(
+            tracker, "flight-1",
+            _silent_for(STRANDED_SILENCE_THRESHOLD_SECONDS + 60),
+        )
+
+        # First scan: deadline breach.
+        assert _scan_for_deadline_breaches(reg) == 1
+        # Second scan: also stranded.
+        assert _scan_for_stranded_sessions(reg, tracker) == 1
+
+        session = reg.get_by_flight_session_id("flight-1")
+        assert session.exit_deadline_breached_at is not None
+        assert session.stranded_flagged_at is not None
+        assert reg.count_past_deadline() == 1
+        assert reg.count_stranded() == 1
+
+
+class TestStrandedCounterIntegration:
+    def test_count_increments_on_flag(self):
+        reg = ActiveSessionRegistry()
+        reg.register(_make_session("flight-1"))
+        tracker = DroneStateTracker()
+        _populate_tracker(
+            tracker, "flight-1",
+            _silent_for(STRANDED_SILENCE_THRESHOLD_SECONDS + 60),
+        )
+        assert reg.count_stranded() == 0
+
+        _scan_for_stranded_sessions(reg, tracker)
+        assert reg.count_stranded() == 1
+
+    def test_count_unchanged_on_repeat_sweep(self):
+        reg = ActiveSessionRegistry()
+        reg.register(_make_session("flight-1"))
+        tracker = DroneStateTracker()
+        _populate_tracker(
+            tracker, "flight-1",
+            _silent_for(STRANDED_SILENCE_THRESHOLD_SECONDS + 60),
+        )
+
+        _scan_for_stranded_sessions(reg, tracker)
+        first_count = reg.count_stranded()
+        _scan_for_stranded_sessions(reg, tracker)
+        second_count = reg.count_stranded()
 
         assert first_count == second_count == 1

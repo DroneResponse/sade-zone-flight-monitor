@@ -48,6 +48,7 @@ STUB_FINALIZATION_DELAY_SECONDS = 5.0
 EXIT_GRACE_PERIOD_SECONDS = 300.0  # 5 minutes of telemetry silence before finalizing
 EXIT_GRACE_CHECK_INTERVAL_SECONDS = 30.0  # how often to check for new telemetry
 SWEEPER_INTERVAL_SECONDS = 60.0  # how often the periodic sweeper scans the registry
+STRANDED_SILENCE_THRESHOLD_SECONDS = 600.0  # 10 min silent telemetry → flag stranded
 
 # ── Shared state ─────────────────────────────────────────────────────────────
 # These module-level instances are the single source of truth for active
@@ -126,23 +127,100 @@ def _scan_for_deadline_breaches(reg: ActiveSessionRegistry) -> int:
     return newly_flagged
 
 
-async def _run_session_sweeper(reg: ActiveSessionRegistry) -> None:
-    """Periodically scan the registry for deadline breaches.
+def _scan_for_stranded_sessions(
+    reg: ActiveSessionRegistry,
+    tracker: DroneStateTracker,
+) -> int:
+    """One sweep iteration: flag silent sessions with no exit-request.
+
+    Stranded means: the drone was transmitting (DroneState exists), it has
+    now been silent for longer than ``STRANDED_SILENCE_THRESHOLD_SECONDS``,
+    and SADE has not sent an exit-request.  Sessions where no telemetry
+    has ever arrived are deliberately not flagged here — that case belongs
+    to the deadline-breach detector via ``requested_exit_time``, since
+    flagging "drone hasn't shown up yet" would false-positive on every
+    session before its first MQTT message.
+
+    Returns the number of sessions newly flagged on this pass.
+
+    Skipped for sessions where:
+    - ``stranded_flagged_at`` is already set (one-shot edge detector).
+    - ``exit_requested_at`` is set (SADE has already closed it out).
+    - No DroneState exists for the session yet.
+    - ``state.last_seen`` is empty or unparseable as ISO 8601.
+    - The silence duration is below the threshold.
+    """
+    now_dt = datetime.now(timezone.utc)
+    now_iso = now_dt.isoformat()
+    newly_flagged = 0
+
+    for session in list(reg.snapshot().values()):
+        if session.stranded_flagged_at is not None:
+            continue
+        if session.exit_requested_at is not None:
+            continue
+
+        state = tracker.get(session.flight_session_id)
+        if state is None:
+            continue
+        if not state.last_seen:
+            continue
+
+        try:
+            last_seen_dt = datetime.fromisoformat(state.last_seen)
+        except (TypeError, ValueError):
+            LOGGER.warning(
+                "Skipping stranded check for session with unparseable "
+                "last_seen. flight_session_id=%s value=%r",
+                session.flight_session_id,
+                state.last_seen,
+            )
+            continue
+
+        if last_seen_dt.tzinfo is None:
+            last_seen_dt = last_seen_dt.replace(tzinfo=timezone.utc)
+
+        silence_seconds = (now_dt - last_seen_dt).total_seconds()
+        if silence_seconds < STRANDED_SILENCE_THRESHOLD_SECONDS:
+            continue
+
+        session.stranded_flagged_at = now_iso
+        newly_flagged += 1
+        LOGGER.warning(
+            "Session stranded — telemetry silent for %.1f minutes, no exit-request. "
+            "flight_session_id=%s drone_id=%s last_seen=%s",
+            silence_seconds / 60.0,
+            session.flight_session_id,
+            session.drone_id,
+            state.last_seen,
+        )
+
+    return newly_flagged
+
+
+async def _run_session_sweeper(
+    reg: ActiveSessionRegistry,
+    tracker: DroneStateTracker,
+) -> None:
+    """Periodically scan the registry for deadline breaches and stranded sessions.
 
     Runs forever until cancelled (typically by the FastAPI lifespan
     shutdown hook).  An exception inside one iteration is logged but
     does not stop the loop — a stuck registry shouldn't take the whole
-    sweeper down.
+    sweeper down.  Both checks run together because they share an
+    iteration cadence and both are cheap O(N) over the registry.
     """
     LOGGER.info(
-        "Session sweeper started: interval=%.0fs",
+        "Session sweeper started: interval=%.0fs stranded_threshold=%.0fs",
         SWEEPER_INTERVAL_SECONDS,
+        STRANDED_SILENCE_THRESHOLD_SECONDS,
     )
     try:
         while True:
             await asyncio.sleep(SWEEPER_INTERVAL_SECONDS)
             try:
                 _scan_for_deadline_breaches(reg)
+                _scan_for_stranded_sessions(reg, tracker)
             except Exception:  # noqa: BLE001
                 LOGGER.exception("Session sweeper iteration failed")
     except asyncio.CancelledError:
@@ -154,7 +232,7 @@ async def _run_session_sweeper(reg: ActiveSessionRegistry) -> None:
 async def _lifespan(_app: FastAPI):
     """FastAPI lifespan: spawn the session sweeper on startup, cancel on shutdown."""
     sweeper_task = asyncio.create_task(
-        _run_session_sweeper(registry),
+        _run_session_sweeper(registry, state_tracker),
         name="session-sweeper",
     )
     try:
@@ -475,9 +553,10 @@ async def exit_request(
 
 @app.get("/health", summary="Liveness check")
 async def health(reg: ActiveSessionRegistry = Depends(get_registry)) -> dict:
-    """Return server status, active-session counts, and deadline-breach counter."""
+    """Return server status, active-session count, and sweeper flag counters."""
     return {
         "status": "ok",
         "active_sessions": reg.count(),
         "sessions_past_deadline": reg.count_past_deadline(),
+        "sessions_stranded": reg.count_stranded(),
     }

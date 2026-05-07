@@ -302,16 +302,19 @@ class TestDeadlineFields:
 
         assert session.exit_requested_at is None
         assert session.exit_deadline_breached_at is None
+        assert session.stranded_flagged_at is None
 
     def test_fields_can_be_set(self):
         session = ActiveFlightSession(
             flight_session_id="flight-001",
             exit_requested_at="2026-03-09T19:00:00+00:00",
             exit_deadline_breached_at="2026-03-09T19:05:00+00:00",
+            stranded_flagged_at="2026-03-09T19:10:00+00:00",
         )
 
         assert session.exit_requested_at == "2026-03-09T19:00:00+00:00"
         assert session.exit_deadline_breached_at == "2026-03-09T19:05:00+00:00"
+        assert session.stranded_flagged_at == "2026-03-09T19:10:00+00:00"
 
 
 class TestCountPastDeadline:
@@ -373,3 +376,80 @@ class TestCountPastDeadline:
 
         reg.complete("flight-A")
         assert reg.count_past_deadline() == 0
+
+
+class TestCountStranded:
+    def test_empty_registry(self):
+        reg = ActiveSessionRegistry()
+        assert reg.count_stranded() == 0
+
+    def test_no_sessions_flagged(self):
+        reg = ActiveSessionRegistry()
+        reg.register(_make_session("flight-A", drone_id="drone-A"))
+        reg.register(_make_session("flight-B", drone_id="drone-B"))
+
+        assert reg.count_stranded() == 0
+
+    def test_one_session_flagged(self):
+        reg = ActiveSessionRegistry()
+        reg.register(_make_session("flight-A", drone_id="drone-A"))
+        flagged = _make_session(
+            "flight-B",
+            drone_id="drone-B",
+            stranded_flagged_at="2026-03-09T19:10:00+00:00",
+        )
+        reg.register(flagged)
+
+        assert reg.count_stranded() == 1
+
+    def test_mixed_set_and_unset(self):
+        reg = ActiveSessionRegistry()
+        for i in range(3):
+            reg.register(
+                _make_session(
+                    f"flight-stranded-{i}",
+                    drone_id=f"drone-stranded-{i}",
+                    stranded_flagged_at="2026-03-09T19:10:00+00:00",
+                )
+            )
+        for i in range(2):
+            reg.register(
+                _make_session(
+                    f"flight-clean-{i}",
+                    drone_id=f"drone-clean-{i}",
+                )
+            )
+
+        assert reg.count_stranded() == 3
+        assert reg.count() == 5
+
+    def test_count_drops_when_session_completes(self):
+        reg = ActiveSessionRegistry()
+        reg.register(
+            _make_session(
+                "flight-A",
+                drone_id="drone-A",
+                stranded_flagged_at="2026-03-09T19:10:00+00:00",
+            )
+        )
+        assert reg.count_stranded() == 1
+
+        reg.complete("flight-A")
+        assert reg.count_stranded() == 0
+
+    def test_counters_are_independent(self):
+        """A session can carry both flags simultaneously and each counter
+        reports them correctly."""
+        reg = ActiveSessionRegistry()
+        reg.register(
+            _make_session(
+                "flight-both",
+                drone_id="drone-both",
+                exit_deadline_breached_at="2026-03-09T19:05:00+00:00",
+                stranded_flagged_at="2026-03-09T19:10:00+00:00",
+            )
+        )
+
+        assert reg.count_past_deadline() == 1
+        assert reg.count_stranded() == 1
+        assert reg.count() == 1

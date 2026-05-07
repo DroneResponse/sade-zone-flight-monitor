@@ -28,6 +28,10 @@ Scenarios tested:
      requested_exit_time, wait past the deadline + sweeper interval,
      verify /health.sessions_past_deadline increments and the session's
      exit_deadline_breached_at field is stamped
+  7. Stranded flag — register, inject one telemetry update, let it age
+     past the (test-shortened) silence threshold without an exit-request,
+     verify /health.sessions_stranded increments and the session's
+     stranded_flagged_at is stamped
 """
 
 from __future__ import annotations
@@ -54,6 +58,10 @@ TEST_GRACE_CHECK_INTERVAL_SECONDS = 3.0
 # Shortened sweeper interval so deadline-breach scenarios complete in
 # seconds rather than the production cadence (60s).
 TEST_SWEEPER_INTERVAL_SECONDS = 2.0
+
+# Shortened stranded-silence threshold so the stranded-flag scenario
+# completes in seconds.  Production is 600s (10 min).
+TEST_STRANDED_SILENCE_THRESHOLD_SECONDS = 5.0
 
 # How long to wait after the grace period should have expired.
 GRACE_BUFFER_SECONDS = 5.0
@@ -100,6 +108,7 @@ async def _start_api_server(host: str, port: int) -> asyncio.Task:
     srv.EXIT_GRACE_PERIOD_SECONDS = TEST_GRACE_PERIOD_SECONDS
     srv.EXIT_GRACE_CHECK_INTERVAL_SECONDS = TEST_GRACE_CHECK_INTERVAL_SECONDS
     srv.SWEEPER_INTERVAL_SECONDS = TEST_SWEEPER_INTERVAL_SECONDS
+    srv.STRANDED_SILENCE_THRESHOLD_SECONDS = TEST_STRANDED_SILENCE_THRESHOLD_SECONDS
 
     config = uvicorn.Config(srv.app, host=host, port=port, log_level="warning")
     server = uvicorn.Server(config)
@@ -416,6 +425,97 @@ async def scenario_deadline_breach_flag(base_url: str) -> bool:
     return True
 
 
+async def scenario_stranded_flag(base_url: str) -> bool:
+    """Scenario 7: Sweeper flags a session whose telemetry has gone silent.
+
+    Stranded means: the drone was transmitting (DroneState exists), then
+    the telemetry stopped, and SADE never sent an exit-request.  With test
+    constants (silence_threshold=5s, sweeper=2s):
+      * t=0  register session
+      * t=0  inject one telemetry update; state.last_seen = now
+      * t=8  silence > 5s threshold and >=1 sweeper tick has fired past
+              the threshold — session must be flagged
+      * t=8  /health.sessions_stranded == 1
+              session.stranded_flagged_at is a stamped ISO timestamp
+
+    Sleeps 8s after telemetry injection — covers the threshold (5s) plus
+    one full sweeper interval (2s) plus 1s phase-margin so we don't depend
+    on initial sweeper alignment.
+
+    Cleanup uses ``registry.complete(fid)`` — same direct pattern as
+    Scenario 6.
+    """
+    from datetime import datetime, timezone
+
+    from app.api.server import registry, state_tracker
+
+    LOGGER.info("── Scenario 7: Stranded flag (silent + no exit-request) ──")
+
+    fid = f"stranded-{uuid4()}"
+    drone_id = "drone-stranded"
+
+    ok = await _register_session(base_url, fid, drone_id)
+    if not ok:
+        LOGGER.error("  FAIL: Registration failed")
+        return False
+
+    # Simulate one telemetry update — what the worker does in production.
+    state_tracker.update(
+        fid,
+        drone_id=drone_id,
+        session_source="aws",
+        raw_message={},
+        parsed_payload={},
+        mission_status=None,
+        mode=None,
+        position=None,
+        last_seen=datetime.now(timezone.utc).isoformat(),
+    )
+    LOGGER.info("  Injected one telemetry update at t=0; will let it age out")
+
+    wait = TEST_STRANDED_SILENCE_THRESHOLD_SECONDS + TEST_SWEEPER_INTERVAL_SECONDS + 1.0
+    LOGGER.info(
+        "  Waiting %.0fs for silence to exceed %.0fs threshold and sweeper to fire...",
+        wait,
+        TEST_STRANDED_SILENCE_THRESHOLD_SECONDS,
+    )
+    await asyncio.sleep(wait)
+
+    health = await asyncio.to_thread(_get_json, f"{base_url}/health")
+    stranded = health.get("sessions_stranded", -1)
+    if stranded < 1:
+        LOGGER.error(
+            "  FAIL: Expected sessions_stranded >= 1, got %s. /health=%s",
+            stranded, health,
+        )
+        registry.complete(fid)
+        state_tracker.pop(fid)
+        return False
+
+    session = registry.get_by_flight_session_id(fid)
+    if session is None or session.stranded_flagged_at is None:
+        LOGGER.error(
+            "  FAIL: Expected stranded_flagged_at to be stamped on the session. "
+            "session=%s flag=%s",
+            session,
+            getattr(session, "stranded_flagged_at", None),
+        )
+        registry.complete(fid)
+        state_tracker.pop(fid)
+        return False
+
+    LOGGER.info(
+        "  PASS: sessions_stranded=%d; flagged session "
+        "stranded_flagged_at=%s",
+        stranded,
+        session.stranded_flagged_at,
+    )
+
+    registry.complete(fid)
+    state_tracker.pop(fid)
+    return True
+
+
 async def scenario_multiple_exits(base_url: str) -> bool:
     """Scenario 4: Multiple grace periods run independently."""
     LOGGER.info("── Scenario 4: Multiple simultaneous exits ──")
@@ -482,6 +582,7 @@ async def run_test(args: argparse.Namespace) -> bool:
         results.append(("Telemetry then silence", await scenario_telemetry_then_silence(base_url)))
         results.append(("Multiple exits", await scenario_multiple_exits(base_url)))
         results.append(("Deadline breach flag", await scenario_deadline_breach_flag(base_url)))
+        results.append(("Stranded flag", await scenario_stranded_flag(base_url)))
     finally:
         api_task.cancel()
         await asyncio.gather(api_task, return_exceptions=True)
