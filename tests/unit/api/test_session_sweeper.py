@@ -17,7 +17,10 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from app.api.server import (
+    FORCE_CLOSE_THRESHOLD_SECONDS,
     STRANDED_SILENCE_THRESHOLD_SECONDS,
+    _earliest_flag_dt,
+    _find_force_close_candidates,
     _scan_for_deadline_breaches,
     _scan_for_stranded_sessions,
 )
@@ -453,3 +456,182 @@ class TestStrandedCounterIntegration:
         second_count = reg.count_stranded()
 
         assert first_count == second_count == 1
+
+
+# ── Force-close backstop ─────────────────────────────────────────────────────
+#
+# The async _scan_for_force_close itself isn't unit-tested directly here —
+# it just iterates the candidate list and calls _finalize_session_to_sade
+# (which posts to a real HTTP endpoint).  The interesting / branchy logic
+# lives in two synchronous helpers:
+#   _earliest_flag_dt(session)        — datetime parsing + earliest-flag picker
+#   _find_force_close_candidates(reg) — the eligibility filter
+# Both are exercised by the integration test in addition to these unit tests.
+
+
+def _flag_iso_for(seconds_ago: float) -> str:
+    """ISO timestamp that's ``seconds_ago`` seconds in the past."""
+    return _iso(datetime.now(timezone.utc) - timedelta(seconds=seconds_ago))
+
+
+class TestEarliestFlagDt:
+    def test_no_flags_returns_none(self):
+        session = _make_session("flight-1")
+        assert _earliest_flag_dt(session) is None
+
+    def test_only_deadline_flag(self):
+        ts = _flag_iso_for(100)
+        session = _make_session("flight-1", exit_deadline_breached_at=ts)
+        result = _earliest_flag_dt(session)
+        assert result is not None
+        assert result.tzinfo is not None
+
+    def test_only_stranded_flag(self):
+        ts = _flag_iso_for(50)
+        session = _make_session("flight-1", stranded_flagged_at=ts)
+        result = _earliest_flag_dt(session)
+        assert result is not None
+
+    def test_both_flags_returns_earlier(self):
+        """The 24h backstop clock starts at whichever flag fired first."""
+        earlier = _flag_iso_for(200)
+        later = _flag_iso_for(100)
+        session = _make_session(
+            "flight-1",
+            exit_deadline_breached_at=earlier,
+            stranded_flagged_at=later,
+        )
+        earliest = _earliest_flag_dt(session)
+        assert earliest is not None
+        # The returned dt should be at or near the earlier timestamp.
+        # Use a 1s tolerance for parse jitter / wall-clock drift.
+        expected = datetime.fromisoformat(earlier)
+        if expected.tzinfo is None:
+            expected = expected.replace(tzinfo=timezone.utc)
+        assert abs((earliest - expected).total_seconds()) < 1.0
+
+    def test_unparseable_flag_skipped(self):
+        """A bad timestamp on one flag doesn't poison the other."""
+        good = _flag_iso_for(100)
+        session = _make_session(
+            "flight-1",
+            exit_deadline_breached_at="not-a-date",
+            stranded_flagged_at=good,
+        )
+        result = _earliest_flag_dt(session)
+        assert result is not None  # falls back to the parseable one
+
+    def test_all_flags_unparseable_returns_none(self):
+        session = _make_session(
+            "flight-1",
+            exit_deadline_breached_at="garbage-1",
+            stranded_flagged_at="garbage-2",
+        )
+        assert _earliest_flag_dt(session) is None
+
+    def test_naive_flag_treated_as_utc(self):
+        """A naive ISO string still produces a tz-aware datetime."""
+        naive = (
+            datetime.now(timezone.utc) - timedelta(seconds=100)
+        ).replace(tzinfo=None).isoformat()
+        session = _make_session("flight-1", exit_deadline_breached_at=naive)
+        result = _earliest_flag_dt(session)
+        assert result is not None
+        assert result.tzinfo is not None
+
+
+class TestFindForceCloseCandidates:
+    def test_empty_registry(self):
+        reg = ActiveSessionRegistry()
+        assert _find_force_close_candidates(reg) == []
+
+    def test_no_flagged_sessions(self):
+        reg = ActiveSessionRegistry()
+        reg.register(_make_session("flight-1"))
+        reg.register(_make_session("flight-2"))
+        assert _find_force_close_candidates(reg) == []
+
+    def test_recent_flag_not_a_candidate(self):
+        """Just-flagged sessions are too young for force-close."""
+        recent = _flag_iso_for(60)  # 1 minute ago
+        reg = ActiveSessionRegistry()
+        reg.register(_make_session("flight-1", exit_deadline_breached_at=recent))
+        reg.register(_make_session("flight-2", stranded_flagged_at=recent))
+        assert _find_force_close_candidates(reg) == []
+
+    def test_flag_just_under_threshold_not_a_candidate(self):
+        almost = _flag_iso_for(FORCE_CLOSE_THRESHOLD_SECONDS - 60)
+        reg = ActiveSessionRegistry()
+        reg.register(_make_session("flight-1", exit_deadline_breached_at=almost))
+        assert _find_force_close_candidates(reg) == []
+
+    def test_flag_past_threshold_is_a_candidate(self):
+        old = _flag_iso_for(FORCE_CLOSE_THRESHOLD_SECONDS + 60)
+        reg = ActiveSessionRegistry()
+        reg.register(_make_session("flight-1", exit_deadline_breached_at=old))
+        reg.register(_make_session("flight-2", stranded_flagged_at=old))
+        reg.register(_make_session("flight-3"))  # no flag — not eligible
+
+        candidates = _find_force_close_candidates(reg)
+        ids = {c.flight_session_id for c in candidates}
+        assert ids == {"flight-1", "flight-2"}
+
+    def test_session_with_exit_request_not_a_candidate(self):
+        """SADE has now closed it — grace task owns finalization, not us."""
+        old = _flag_iso_for(FORCE_CLOSE_THRESHOLD_SECONDS + 60)
+        reg = ActiveSessionRegistry()
+        reg.register(
+            _make_session(
+                "flight-1",
+                exit_deadline_breached_at=old,
+                exit_requested_at="2026-03-09T19:00:00+00:00",
+            )
+        )
+        assert _find_force_close_candidates(reg) == []
+
+    def test_both_flags_set_uses_earliest_for_eligibility(self):
+        """A session with one old flag and one fresh flag IS eligible —
+        the 24 h timer starts at the earlier flag, which is past threshold."""
+        old = _flag_iso_for(FORCE_CLOSE_THRESHOLD_SECONDS + 60)
+        recent = _flag_iso_for(60)
+        reg = ActiveSessionRegistry()
+        reg.register(
+            _make_session(
+                "flight-1",
+                exit_deadline_breached_at=old,
+                stranded_flagged_at=recent,
+            )
+        )
+        assert len(_find_force_close_candidates(reg)) == 1
+
+    def test_both_flags_set_both_recent_not_eligible(self):
+        """If both flags are recent, the earliest is still recent → no close."""
+        recent_a = _flag_iso_for(60)
+        recent_b = _flag_iso_for(120)
+        reg = ActiveSessionRegistry()
+        reg.register(
+            _make_session(
+                "flight-1",
+                exit_deadline_breached_at=recent_a,
+                stranded_flagged_at=recent_b,
+            )
+        )
+        assert _find_force_close_candidates(reg) == []
+
+    def test_unparseable_flags_skip_session(self):
+        """A session whose only flag value is malformed is ineligible —
+        we can't compute its age, so we don't close it."""
+        reg = ActiveSessionRegistry()
+        reg.register(
+            _make_session(
+                "flight-1",
+                exit_deadline_breached_at="not-a-date",
+            )
+        )
+        # Plus one valid candidate so we know the function doesn't bail out
+        # entirely on the first malformed entry.
+        old = _flag_iso_for(FORCE_CLOSE_THRESHOLD_SECONDS + 60)
+        reg.register(_make_session("flight-2", stranded_flagged_at=old))
+
+        ids = {c.flight_session_id for c in _find_force_close_candidates(reg)}
+        assert ids == {"flight-2"}

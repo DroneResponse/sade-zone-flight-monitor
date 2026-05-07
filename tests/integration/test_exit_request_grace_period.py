@@ -32,6 +32,10 @@ Scenarios tested:
      past the (test-shortened) silence threshold without an exit-request,
      verify /health.sessions_stranded increments and the session's
      stranded_flagged_at is stamped
+  8. Force-close backstop — register a session with a near-future
+     requested_exit_time, let the deadline-breach flag fire, then keep
+     waiting until the (test-shortened) force-close threshold elapses
+     past the flag.  Verify the session is gone from the registry.
 """
 
 from __future__ import annotations
@@ -62,6 +66,10 @@ TEST_SWEEPER_INTERVAL_SECONDS = 2.0
 # Shortened stranded-silence threshold so the stranded-flag scenario
 # completes in seconds.  Production is 600s (10 min).
 TEST_STRANDED_SILENCE_THRESHOLD_SECONDS = 5.0
+
+# Shortened force-close threshold so the force-close scenario completes
+# in seconds.  Production is 86400s (24 h).
+TEST_FORCE_CLOSE_THRESHOLD_SECONDS = 4.0
 
 # How long to wait after the grace period should have expired.
 GRACE_BUFFER_SECONDS = 5.0
@@ -109,6 +117,7 @@ async def _start_api_server(host: str, port: int) -> asyncio.Task:
     srv.EXIT_GRACE_CHECK_INTERVAL_SECONDS = TEST_GRACE_CHECK_INTERVAL_SECONDS
     srv.SWEEPER_INTERVAL_SECONDS = TEST_SWEEPER_INTERVAL_SECONDS
     srv.STRANDED_SILENCE_THRESHOLD_SECONDS = TEST_STRANDED_SILENCE_THRESHOLD_SECONDS
+    srv.FORCE_CLOSE_THRESHOLD_SECONDS = TEST_FORCE_CLOSE_THRESHOLD_SECONDS
 
     config = uvicorn.Config(srv.app, host=host, port=port, log_level="warning")
     server = uvicorn.Server(config)
@@ -516,6 +525,79 @@ async def scenario_stranded_flag(base_url: str) -> bool:
     return True
 
 
+async def scenario_force_close_backstop(base_url: str) -> bool:
+    """Scenario 8: Sweeper force-closes a session whose flag has aged out.
+
+    Memory-safety backstop: when the deadline-breach (or stranded) flag
+    has been on a session for longer than FORCE_CLOSE_THRESHOLD_SECONDS
+    without a SADE exit-request, the sweeper closes it via the canonical
+    finalize POST.  This test exercises the deadline-breach path.
+
+    Timeline (test constants: sweeper=2s, force_close=4s, deadline=now+1s):
+      * t=0     register with requested_exit_time = now + 1s
+      * t=1     deadline elapses
+      * t=~3    sweeper flags exit_deadline_breached_at (interval=2s)
+      * t=~7    flag age = 4s ≥ threshold, sweeper force-closes the
+                session (next tick after flag aged out)
+      * t=10    /health.active_sessions == 0 and the session is gone
+                from the registry
+
+    Sleeps 11s after registration to give the timeline plenty of slack
+    regardless of the initial sweeper phase.
+
+    Requires TRACKER_FINALIZED_URL (force-close POSTs to it) — the
+    test_mqtt_telemetry_pipeline.py-style catcher pattern works.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from app.api.server import registry
+
+    LOGGER.info("── Scenario 8: Force-close backstop ──")
+
+    fid = f"force-close-{uuid4()}"
+    drone_id = "drone-force-close"
+    deadline_iso = (datetime.now(timezone.utc) + timedelta(seconds=1)).isoformat()
+
+    status, body = await asyncio.to_thread(
+        _post_json,
+        f"{base_url}/flight-monitor/register-session",
+        {
+            "flight_session_id": fid,
+            "drone_id": drone_id,
+            "pilot_id": f"pilot-{drone_id}",
+            "requested_exit_time": deadline_iso,
+        },
+    )
+    if status != 202 or body.get("action") != "registered":
+        LOGGER.error("  FAIL: Registration failed (HTTP %s action=%s)", status, body.get("action"))
+        return False
+    LOGGER.info("  Registered with requested_exit_time=%s", deadline_iso)
+
+    # Wait long enough for: deadline to pass, sweeper to flag, threshold
+    # to elapse since flag, sweeper to fire force-close.  With sweeper=2s
+    # and force_close_threshold=4s we need roughly:
+    #   1s deadline + 2s flag latency + 4s threshold + 2s force-close latency
+    #   + 2s buffer = 11s
+    wait = 11.0
+    LOGGER.info(
+        "  Waiting %.0fs for deadline-breach flag and force-close to fire...", wait
+    )
+    await asyncio.sleep(wait)
+
+    # The session should be gone — registry.complete fired during force-close.
+    if registry.get_by_flight_session_id(fid) is not None:
+        LOGGER.error(
+            "  FAIL: expected session to be force-closed and removed, "
+            "but it's still in the registry. session=%s",
+            registry.get_by_flight_session_id(fid),
+        )
+        registry.complete(fid)
+        return False
+
+    LOGGER.info("  PASS: session force-closed and removed from registry")
+    return True
+
+
 async def scenario_multiple_exits(base_url: str) -> bool:
     """Scenario 4: Multiple grace periods run independently."""
     LOGGER.info("── Scenario 4: Multiple simultaneous exits ──")
@@ -583,6 +665,7 @@ async def run_test(args: argparse.Namespace) -> bool:
         results.append(("Multiple exits", await scenario_multiple_exits(base_url)))
         results.append(("Deadline breach flag", await scenario_deadline_breach_flag(base_url)))
         results.append(("Stranded flag", await scenario_stranded_flag(base_url)))
+        results.append(("Force-close backstop", await scenario_force_close_backstop(base_url)))
     finally:
         api_task.cancel()
         await asyncio.gather(api_task, return_exceptions=True)

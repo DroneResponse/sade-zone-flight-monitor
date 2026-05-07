@@ -50,6 +50,17 @@ EXIT_GRACE_CHECK_INTERVAL_SECONDS = 30.0  # how often to check for new telemetry
 SWEEPER_INTERVAL_SECONDS = 60.0  # how often the periodic sweeper scans the registry
 STRANDED_SILENCE_THRESHOLD_SECONDS = 600.0  # 10 min silent telemetry → flag stranded
 
+# Memory-safety backstop: a session that has been carrying a deadline-breach
+# or stranded flag for longer than this gets force-closed by the sweeper
+# (canonical finalize POST + registry/tracker clear).  24 h is a deliberate
+# choice — long enough to avoid prematurely closing a session during a
+# transient connectivity blip on a long flight, short enough that the
+# memory leak from "session never gets an exit-request" is bounded to a
+# day rather than indefinite.  Tunable: 12 h would be more aggressive,
+# 48 h more conservative.  Adjust here and update the unit tests' bounds
+# checks if you change it.
+FORCE_CLOSE_THRESHOLD_SECONDS = 86400.0
+
 # ── Shared state ─────────────────────────────────────────────────────────────
 # These module-level instances are the single source of truth for active
 # sessions and accumulated telemetry state.  Import them and pass to
@@ -198,6 +209,113 @@ def _scan_for_stranded_sessions(
     return newly_flagged
 
 
+def _earliest_flag_dt(session) -> datetime | None:
+    """Return the earliest sweeper-flag timestamp on a session, or None.
+
+    A session can carry both ``exit_deadline_breached_at`` and
+    ``stranded_flagged_at``.  The force-close clock starts at whichever
+    fired first, so the 24 h backstop closes earlier when both signals
+    have been raised.  Returns None when neither field is set.
+
+    Unparseable timestamps are skipped silently rather than crashing the
+    sweeper.  ``_scan_for_stranded_sessions`` already logs a warning the
+    first time a malformed timestamp is observed, so we don't double-log
+    here.  Naive datetimes are treated as UTC, matching the convention
+    elsewhere in this module.
+    """
+    parsed: list[datetime] = []
+    for raw in (session.exit_deadline_breached_at, session.stranded_flagged_at):
+        if not raw:
+            continue
+        try:
+            dt = datetime.fromisoformat(raw)
+        except (TypeError, ValueError):
+            continue
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        parsed.append(dt)
+    return min(parsed) if parsed else None
+
+
+def _find_force_close_candidates(reg: ActiveSessionRegistry) -> list:
+    """Return sessions whose earliest flag is older than the force-close threshold.
+
+    Pulled out of the async scan so it can be unit-tested without async
+    scaffolding or HTTP catchers.  Excludes:
+    - sessions where SADE has now sent an exit-request (the grace-period
+      task owns finalization in that case);
+    - sessions with no flags set (nothing to close);
+    - sessions whose earliest flag is younger than the threshold.
+    """
+    now_dt = datetime.now(timezone.utc)
+    candidates = []
+    for session in list(reg.snapshot().values()):
+        if session.exit_requested_at is not None:
+            continue
+        flag_dt = _earliest_flag_dt(session)
+        if flag_dt is None:
+            continue
+        if (now_dt - flag_dt).total_seconds() < FORCE_CLOSE_THRESHOLD_SECONDS:
+            continue
+        candidates.append(session)
+    return candidates
+
+
+async def _scan_for_force_close(
+    reg: ActiveSessionRegistry,
+    tracker: DroneStateTracker,
+) -> int:
+    """Force-close sessions whose flag has aged past FORCE_CLOSE_THRESHOLD_SECONDS.
+
+    Memory-safety backstop: when a flagged session has been sitting in
+    the registry past the configured threshold (default 24 h) without a
+    SADE exit-request, we close it ourselves via the canonical finalize
+    sequence (``_finalize_session_to_sade``).  Logged at WARNING with
+    ``flag=deadline_breach`` or ``flag=stranded`` so the operational
+    cause is visible in logs.
+
+    Per-session POST failures are logged but do not abort the loop —
+    one stuck session shouldn't block the others from being closed.
+
+    Returns the number of sessions force-closed on this pass.
+    """
+    candidates = _find_force_close_candidates(reg)
+    if not candidates:
+        return 0
+
+    closed = 0
+    for session in candidates:
+        which_flag = (
+            "deadline_breach"
+            if session.exit_deadline_breached_at is not None
+            else "stranded"
+        )
+        LOGGER.warning(
+            "Force-closing session as memory-safety backstop. "
+            "flight_session_id=%s drone_id=%s flag=%s "
+            "deadline_breached_at=%s stranded_flagged_at=%s",
+            session.flight_session_id,
+            session.drone_id,
+            which_flag,
+            session.exit_deadline_breached_at,
+            session.stranded_flagged_at,
+        )
+        try:
+            await _finalize_session_to_sade(
+                reg,
+                tracker,
+                session.flight_session_id,
+                reason=f"force_close_backstop:{which_flag}",
+            )
+            closed += 1
+        except Exception:  # noqa: BLE001
+            LOGGER.exception(
+                "Force-close failed for flight_session_id=%s",
+                session.flight_session_id,
+            )
+    return closed
+
+
 async def _run_session_sweeper(
     reg: ActiveSessionRegistry,
     tracker: DroneStateTracker,
@@ -211,9 +329,11 @@ async def _run_session_sweeper(
     iteration cadence and both are cheap O(N) over the registry.
     """
     LOGGER.info(
-        "Session sweeper started: interval=%.0fs stranded_threshold=%.0fs",
+        "Session sweeper started: interval=%.0fs stranded_threshold=%.0fs "
+        "force_close_threshold=%.0fs",
         SWEEPER_INTERVAL_SECONDS,
         STRANDED_SILENCE_THRESHOLD_SECONDS,
+        FORCE_CLOSE_THRESHOLD_SECONDS,
     )
     try:
         while True:
@@ -221,6 +341,12 @@ async def _run_session_sweeper(
             try:
                 _scan_for_deadline_breaches(reg)
                 _scan_for_stranded_sessions(reg, tracker)
+                # Force-close runs last so any session flagged on this
+                # tick gets a full SWEEPER_INTERVAL_SECONDS of grace before
+                # it can be force-closed (the threshold check is inclusive
+                # but the flag is brand-new this tick, so the math works
+                # out to "next tick at the earliest").
+                await _scan_for_force_close(reg, tracker)
             except Exception:  # noqa: BLE001
                 LOGGER.exception("Session sweeper iteration failed")
     except asyncio.CancelledError:
