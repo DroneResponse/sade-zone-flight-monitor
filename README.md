@@ -220,6 +220,8 @@ brew services start mosquitto
 
 The script overrides the sweeper / grace / force-close timing constants to short values (8s grace, 5s sweeper, 30s stranded threshold, 60s force-close) so every behaviour is observable in a few minutes. Production values are 5-10× larger.
 
+**For presenters**: full runbook with phase-by-phase narration cues, what to point at on the dashboard, and recovery steps in [DEMO.md](DEMO.md).
+
 ### End-to-end test against real AWS (IoT Core + SADE)
 
 `scripts/run_e2e_aws_test.py` exercises the complete production code path against real AWS infrastructure — mTLS to IoT Core, real outbound POST to SADE's `/tracker-session-finalized`. It spawns the Flight Monitor as a subprocess, plays SADE's outbox role by POSTing `/flight-monitor/register-session` locally, then plays the drone role by publishing real MQTT telemetry to IoT Core using the same mTLS cert (with a distinct `client_id`). Success means the Flight Monitor's log shows `Tracker session finalized: ... reputation_record_id=<id>` — i.e. SADE persisted a real reputation record.
