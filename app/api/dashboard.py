@@ -62,8 +62,12 @@ DASHBOARD_REFRESH_MS = 7000  # browser polling cadence
 # ── Snapshot builder ─────────────────────────────────────────────────────────
 
 
-def _parse_iso_utc(value: str | None) -> datetime | None:
-    """Parse an ISO 8601 timestamp into a UTC-aware datetime, or None."""
+def parse_iso_utc(value: str | None) -> datetime | None:
+    """Parse an ISO 8601 timestamp into a UTC-aware datetime, or None.
+
+    Public so other ``app.api`` modules (e.g. sade_central) can reuse
+    the same lenient parser without duplicating the logic.
+    """
     if not value:
         return None
     try:
@@ -75,8 +79,13 @@ def _parse_iso_utc(value: str | None) -> datetime | None:
     return dt
 
 
-def _classify_status(session: ActiveFlightSession, state: DroneState | None) -> str:
-    """Compute the four-way status badge for a session."""
+def classify_session_status(session: ActiveFlightSession, state: DroneState | None) -> str:
+    """Compute the status badge for a session.
+
+    Public so other ``app.api`` modules can reuse the exact same
+    EXIT_REQUESTED / FLYING / LANDED / WAITING / ACTIVE classification
+    without duplicating the rules.
+    """
     if session.exit_requested_at is not None:
         return "EXIT_REQUESTED"
     if state is None:
@@ -108,7 +117,7 @@ def _build_session_entry(
 
     live: dict[str, Any] | None = None
     if state is not None:
-        last_seen_dt = _parse_iso_utc(state.last_seen)
+        last_seen_dt = parse_iso_utc(state.last_seen)
         seconds_since_last_seen = (
             (now_dt - last_seen_dt).total_seconds() if last_seen_dt is not None else None
         )
@@ -138,7 +147,7 @@ def _build_session_entry(
         "exit_requested_at": session.exit_requested_at,
         "exit_deadline_breached_at": session.exit_deadline_breached_at,
         "stranded_flagged_at": session.stranded_flagged_at,
-        "status": _classify_status(session, state),
+        "status": classify_session_status(session, state),
         "flags": flags,
         "live": live,
     }

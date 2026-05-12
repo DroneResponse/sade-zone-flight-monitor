@@ -137,6 +137,69 @@ No request body.
 }
 ```
 
+### `GET /sade-central/drone_snapshot`
+
+Drone-centric snapshot consumed by SADE Central's "Active Drone Registry +
+States" page. Flat list (no zone/org grouping — SADE Central does its own
+client-side filtering and sorting) plus a pre-aggregated `totals` block so
+the page header can render summary counts without iterating `drones[]`.
+No request body, no query params.
+
+```jsonc
+{
+  "report_time_utc": "2026-05-12T17:42:00.123456+00:00",          // ISO 8601 UTC; when this snapshot was generated
+  "totals": {
+    "active_drones":  3,                                           // len(drones[])
+    "by_status": {                                                 // all five keys always present (zero when none)
+      "EXIT_REQUESTED": 0,
+      "FLYING":         1,
+      "LANDED":         1,
+      "WAITING":        1,
+      "ACTIVE":         0
+    },
+    "by_flag": {                                                   // both keys always present
+      "past_deadline":  0,
+      "stranded":       1
+    }
+  },
+  "drones": [                                                      // array, possibly empty
+    {
+      "drone_id":          "Orange",                               // string | null
+      "flight_session_id": "550e8400-e29b-41d4-a716-446655440000", // string, always present
+      "pilot_id":          "pilot-abc",                            // string | null
+      "organization_id":   "org-xyz",                              // string | null
+      "sade_zone_id":      "zone-123",                             // string | null
+      "status":            "FLYING",                               // EXIT_REQUESTED | FLYING | LANDED | WAITING | ACTIVE
+      "flags":             ["past_deadline"],                      // subset of ["past_deadline", "stranded"]; may be empty
+      "session_window": {
+        "registered_at":        "2026-05-12T17:00:00.000000+00:00",
+        "requested_entry_time": "2026-05-12T17:00:00+00:00",
+        "requested_exit_time":  "2026-05-12T18:00:00+00:00",
+        "exit_requested_at":    null                               // string | null; non-null once SADE sent /exit-request
+      },
+      "live": {                                                    // null when no MQTT message has arrived yet (status=WAITING)
+        "last_seen":                "2026-05-12T17:42:00+00:00",
+        "seconds_since_last_seen":  4.2,                           // server-computed at snapshot time
+        "position": {                                              // null when no GPS fix has been seen
+          "latitude":   41.7547272,
+          "longitude":  -86.191418,
+          "altitude_m": 92.5
+        },
+        "battery_voltage_v":          16.2,                        // float | null
+        "distance_flown_m":           1450.0,                      // haversine accumulator
+        "currently_armed":            true,                        // null when firmware doesn't emit status.armed
+        "current_segment_started_at": "2026-05-12T17:01:00+00:00"  // non-null only when currently_armed=true
+      }
+    }
+  ]
+}
+```
+
+Status classification matches the dashboard's exactly (shared helper in
+`app/api/dashboard.py::classify_session_status`). `flags` is independent of
+`status` — a FLYING session can also be `stranded` if telemetry has been
+silent >10 min. Suggested polling cadence from SADE Central: 5–10 s.
+
 ### `GET /dashboard` / `GET /dashboard/data`
 
 `/dashboard` returns HTML; `/dashboard/data` returns the JSON snapshot

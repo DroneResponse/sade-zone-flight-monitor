@@ -394,6 +394,13 @@ from app.api.dashboard import router as _dashboard_router  # noqa: E402
 
 app.include_router(_dashboard_router)
 
+# Drone-snapshot endpoint consumed by SADE Central's active-drones page.
+# Same late-import pattern as the dashboard router for the same circular-
+# import reason.
+from app.api.sade_central import router as _sade_central_router  # noqa: E402
+
+app.include_router(_sade_central_router)
+
 
 def get_registry() -> ActiveSessionRegistry:
     """FastAPI dependency that provides the shared session registry.
