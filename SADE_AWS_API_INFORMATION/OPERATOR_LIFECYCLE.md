@@ -6,7 +6,7 @@ This guide is the practical sequence for operator-facing testing and integration
 
 Base URL used below:
 
-`http://sarec-sade-use2-api-alb-1413405053.us-east-2.elb.amazonaws.com`
+`https://api.sadezone.org`
 
 ## 1) Create registry records first
 

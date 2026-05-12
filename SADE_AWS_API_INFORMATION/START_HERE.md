@@ -18,7 +18,7 @@ If you are integrating with the deployed SADE AWS API, read these in order:
 
 Current AWS base URL:
 
-`http://sarec-sade-use2-api-alb-1413405053.us-east-2.elb.amazonaws.com`
+`https://api.sadezone.org`
 
 ## Current unfinished/stubbed behavior to note
 

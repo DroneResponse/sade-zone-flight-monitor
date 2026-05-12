@@ -6,7 +6,7 @@ This is the client-facing API contract for teams integrating with the deployed S
 
 ## Base URL
 
-`http://sarec-sade-use2-api-alb-1413405053.us-east-2.elb.amazonaws.com`
+`https://api.sadezone.org`
 
 ## Common rules
 
