@@ -3,9 +3,9 @@
 Handoff reference for the AWS-side work needed to put the Flight Monitor
 into production. Code is complete and shipped on `main`; everything in
 this doc is infrastructure work owned by whoever runs the AWS
-environment (currently Tony).
+environment.
 
-The current `main` commit is the canonical image source. Tag the ECR
+The current `main` commit is the image source. Tag the ECR
 push with the commit SHA so the deployed image traces back to a known
 state.
 
@@ -197,13 +197,7 @@ mTLS via the configured certs.
 
 ### Recommendation
 
-Either is fine. Option A is the more common AWS pattern and is what
-most teams ship by default. Option B is preferred if your threat
-model treats the load balancer as untrusted or if you want one fewer
-place to misconfigure mTLS.
-
-Decide based on your team's operational preference. We don't need to
-know which one before pushing the image.
+Either is fine. I like option A better.
 
 ---
 
