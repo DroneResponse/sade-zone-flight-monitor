@@ -151,14 +151,17 @@ def _build_battery_state(voltage: float | None) -> dict[str, Any]:
     """Build one ``battery_state_in`` / ``battery_state_out`` object.
 
     The schema carries a ``system_charge_pct`` plus a ``slots`` array of
-    ``{slot_id, voltage_v}`` entries.  Current telemetry is voltage-only and
-    single-slot, so this wraps one slot "A".  When firmware starts emitting
-    per-slot voltages the single point of change is this helper.
+    ``{slot_id, voltage_v}`` entries.  Current telemetry is voltage-only
+    and single-slot, so this wraps one slot "A".  When firmware starts
+    emitting per-slot voltages the single point of change is this helper.
+
+    ``system_charge_pct`` is emitted as ``null`` because telemetry does
+    not yet include a battery-percentage field — SADE confirmed null is
+    the correct "unknown" signal until firmware (or a voltage-to-percent
+    curve) provides a real value.
     """
-    # TODO: switch system_charge_pct to null once SADE confirms it's nullable,
-    # or populate it for real once firmware emits a battery-percentage field.
     return {
-        "system_charge_pct": 0.0,
+        "system_charge_pct": None,
         "slots": [
             {
                 "slot_id": "A",

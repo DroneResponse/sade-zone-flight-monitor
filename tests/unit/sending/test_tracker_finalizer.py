@@ -178,14 +178,15 @@ class TestFlightSegmentEvent:
         assert segment["battery_state_in"]["slots"][0]["voltage_v"] == 0.0
         assert segment["battery_state_out"]["slots"][0]["voltage_v"] == 0.0
 
-    def test_system_charge_pct_is_zero_placeholder(self):
-        # Known gap: telemetry carries voltage only.  Change to null (or real
-        # value) once firmware emits a battery-percentage field.
+    def test_system_charge_pct_is_null_until_firmware_emits_one(self):
+        # Telemetry carries voltage only; SADE accepts ``null`` as the
+        # "unknown" signal.  Flip to a real value once firmware emits a
+        # battery-percentage field (or we wire a voltage-to-percent curve).
         state = _make_drone_state()
         segment = _first_flight_segment(build_finalization_payload(state))
 
-        assert segment["battery_state_in"]["system_charge_pct"] == 0.0
-        assert segment["battery_state_out"]["system_charge_pct"] == 0.0
+        assert segment["battery_state_in"]["system_charge_pct"] is None
+        assert segment["battery_state_out"]["system_charge_pct"] is None
 
 
 class TestMultiSegmentEmission:
