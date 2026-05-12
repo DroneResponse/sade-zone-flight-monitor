@@ -352,17 +352,24 @@ docker run -d --restart unless-stopped \
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` |
 | `API_HOST` | `0.0.0.0` | FastAPI bind host |
 | `API_PORT` | `8000` | FastAPI bind port |
+| `API_CA_CERT_PATH` | _(unset)_ | CA bundle used to verify inbound client certs. All three `API_*` cert paths must be set together to enable mTLS, or all three unset for plain HTTP. Partial config fails fast at startup. |
+| `API_SERVER_CERT_PATH` | _(unset)_ | Flight Monitor's own X.509 certificate presented to inbound clients (typically a dedicated "Flight Monitor systems" cert in AWS). |
+| `API_SERVER_KEY_PATH` | _(unset)_ | Private key matching `API_SERVER_CERT_PATH`. **Never bake key material into the image** — mount via `-v /host/api-certs:/api-certs:ro` or ECS secrets. Also reused as the client cert presented to SADE on outbound finalization POSTs. |
+| `TRACKER_CA_CERT_PATH` | _(unset)_ | CA bundle used to verify SADE's server cert on outbound `/tracker-session-finalized` POSTs. Independent from `API_CA_CERT_PATH`. Leave unset to use the system trust store. |
 
 ### Exposed port
 
-`8000` — FastAPI webhook server:
+`8000` — FastAPI webhook server (HTTP or HTTPS depending on whether inbound mTLS is configured):
 - `POST /flight-monitor/register-session`
 - `POST /flight-monitor/exit-request`
 - `GET /health`
+- `GET /dashboard`
 
 ### AWS deployment notes
 
 - **Flight-monitor endpoints must be reachable by SADE** — place the container behind an ALB or NLB so SADE can POST `/flight-monitor/register-session` and `/flight-monitor/exit-request` to this service
+- **Inbound API mTLS** — set `API_CA_CERT_PATH`, `API_SERVER_CERT_PATH`, and `API_SERVER_KEY_PATH` to mount a dedicated "Flight Monitor systems" certificate. All three must be set together; partial config fails fast at startup so a misconfigured bind mount can't silently degrade to plain HTTP. Mount the cert files as a read-only volume (`-v ~/api-certs:/api-certs:ro`). Store the server private key in AWS Secrets Manager when deploying to ECS.
+- **Outbound mTLS to SADE** — the same `API_SERVER_CERT_PATH` and `API_SERVER_KEY_PATH` are reused as the client cert presented to SADE on outbound `/tracker-session-finalized` POSTs (one systems identity in both directions). Set `TRACKER_CA_CERT_PATH` if SADE uses a private/internal CA; leave unset to use the system trust store. Use an `https://` URL in `TRACKER_FINALIZED_URL` so payloads are encrypted in transit — the pipeline logs a warning at startup if the URL is plain `http://`.
 - **`TRACKER_FINALIZED_URL` must be set** — this is a required env var when `FINALIZE_TO_API=true` (the container default). Pass the full URL of the target environment's `/tracker-session-finalized` endpoint via ECS task definition env, `docker run -e`, or equivalent. The pipeline refuses to start if it's unset while finalization is enabled.
 - **MQTT credentials** — pass `MQTT_USERNAME` and `MQTT_PASSWORD` via ECS task definition secrets or AWS Secrets Manager; never bake them into the image
 - **PKI for AWS IoT Core** — mount your CA cert, client cert, and private key as a read-only volume at `/certs/` (`-v ~/sade-certs:/certs:ro`). The pipeline reads them via `MQTT_CA_CERT_PATH`, `MQTT_CLIENT_CERT_PATH`, and `MQTT_PRIVATE_KEY_PATH`. Never `COPY` key material into the image. For ECS, store the private key in AWS Secrets Manager and mount it through the `secrets` section of the task definition.
@@ -487,8 +494,11 @@ On `exit-request`, the session is NOT removed up front — it stays in the regis
 
 ## What still needs to be done
 
-**Authentication on the webhook endpoints**
-`/flight-monitor/register-session` and `/flight-monitor/exit-request` have no auth. Any caller that can reach the port can register or close out a session. For production, this needs at minimum a shared secret header check, ideally mTLS or IAM-signed requests depending on the deployment environment.
+**Inbound API mTLS** *(implemented)*
+`/flight-monitor/register-session`, `/flight-monitor/exit-request`, `/health`, and `/dashboard` are now mTLS-capable via uvicorn's native SSL support. Three env vars (`API_CA_CERT_PATH`, `API_SERVER_CERT_PATH`, `API_SERVER_KEY_PATH`) or the matching `--api-ca-cert` / `--api-server-cert` / `--api-server-key` CLI flags drive the configuration: all three set enables mTLS with `ssl.CERT_REQUIRED` (clients must present a cert signed by the CA bundle); all three unset serves plain HTTP; any partial combination fails fast at startup so a misconfigured bind mount can't silently degrade. Production deployment will use a dedicated "Flight Monitor systems" cert distinct from any operator's personal certificate.
+
+**Outbound client mTLS to SADE** *(implemented)*
+The outbound POST to `/tracker-session-finalized` reuses the same systems identity as the inbound mTLS config: `API_SERVER_CERT_PATH` and `API_SERVER_KEY_PATH` are presented as the client cert during the TLS handshake with SADE, so one cert covers both directions. A separate `TRACKER_CA_CERT_PATH` env var controls the CA bundle used to verify SADE's server cert (defaults to the system trust store; set explicitly when SADE uses a private/internal CA). HTTPS-only verification is always strict (`check_hostname=True`, `CERT_REQUIRED`). At startup the pipeline logs which outbound mode is active and warns if `TRACKER_FINALIZED_URL` is plain `http://` — the warning is intentional because finalization payloads should not traverse production networks unencrypted.
 
 **Battery `system_charge_pct` and multi-slot voltages**
 Per-segment `battery_state_in` / `battery_state_out` currently emit `system_charge_pct: 0.0` and wrap the single telemetry voltage as `slots: [{slot_id: "A", voltage_v: <v>}]`. Two firmware-side gaps block real data here: (1) telemetry does not yet carry a battery percentage field — either firmware adds one or the service needs a voltage-to-percentage curve per battery type; (2) multi-slot drones do not yet emit per-slot voltages, so `slots` is always a single-entry array today. The builder in `app/sending/tracker_finalizer.py` has a single `_build_battery_state()` helper — that is the one-line change point when either gap closes. It is also worth confirming with SADE whether `system_charge_pct: null` is acceptable; if so, the `0.0` placeholder flips to `null` until real data is available.

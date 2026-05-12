@@ -3,18 +3,22 @@
 from __future__ import annotations
 
 import logging
+import ssl
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
 from app.monitoring.state_tracker import DroneState, FlightSegment
 from app.sending.tracker_finalizer import (
     TRACKER_FINALIZED_URL_ENV_VAR,
+    _build_outbound_ssl_context,
     _log_finalization_response,
     _to_utc_z,
     build_finalization_payload,
     build_stub_finalization_payload,
     get_tracker_finalized_url,
+    resolve_outbound_tls_config,
 )
 
 
@@ -534,3 +538,121 @@ class TestLogFinalizationResponse:
 
         assert "unexpected status" in caplog.text
         assert "UNKNOWN" in caplog.text
+
+
+# ── resolve_outbound_tls_config + _build_outbound_ssl_context ────────────────
+
+
+class TestResolveOutboundTlsConfig:
+    """Outbound mTLS env-var resolution."""
+
+    def test_returns_none_when_no_env_vars_set(self, monkeypatch):
+        monkeypatch.delenv("API_SERVER_CERT_PATH", raising=False)
+        monkeypatch.delenv("API_SERVER_KEY_PATH", raising=False)
+        monkeypatch.delenv("TRACKER_CA_CERT_PATH", raising=False)
+
+        assert resolve_outbound_tls_config() is None
+
+    def test_returns_paths_when_all_three_set(self, monkeypatch, tmp_path):
+        cert = tmp_path / "client.crt"
+        key = tmp_path / "client.key"
+        ca = tmp_path / "ca.crt"
+        for f in (cert, key, ca):
+            f.write_text("x")
+
+        monkeypatch.setenv("API_SERVER_CERT_PATH", str(cert))
+        monkeypatch.setenv("API_SERVER_KEY_PATH", str(key))
+        monkeypatch.setenv("TRACKER_CA_CERT_PATH", str(ca))
+
+        assert resolve_outbound_tls_config() == {
+            "ca_cert_path": str(ca),
+            "client_cert_path": str(cert),
+            "client_key_path": str(key),
+        }
+
+    def test_allows_ca_only_no_client_cert(self, monkeypatch, tmp_path):
+        """CA-only is valid: outbound HTTPS with a custom trust store, no client cert.
+
+        Useful when SADE uses a private/internal CA but doesn't require
+        mTLS yet — gives the operator a path to harden incrementally.
+        """
+        ca = tmp_path / "ca.crt"
+        ca.write_text("x")
+        monkeypatch.delenv("API_SERVER_CERT_PATH", raising=False)
+        monkeypatch.delenv("API_SERVER_KEY_PATH", raising=False)
+        monkeypatch.setenv("TRACKER_CA_CERT_PATH", str(ca))
+
+        assert resolve_outbound_tls_config() == {
+            "ca_cert_path": str(ca),
+            "client_cert_path": None,
+            "client_key_path": None,
+        }
+
+    def test_raises_when_cert_set_but_key_missing(self, monkeypatch, tmp_path):
+        """Half-configured client identity is always a misconfiguration."""
+        cert = tmp_path / "client.crt"
+        cert.write_text("x")
+        monkeypatch.setenv("API_SERVER_CERT_PATH", str(cert))
+        monkeypatch.delenv("API_SERVER_KEY_PATH", raising=False)
+        monkeypatch.delenv("TRACKER_CA_CERT_PATH", raising=False)
+
+        with pytest.raises(RuntimeError, match="partially configured"):
+            resolve_outbound_tls_config()
+
+    def test_raises_when_path_does_not_exist(self, monkeypatch, tmp_path):
+        """Missing files surface at startup, not at first POST."""
+        monkeypatch.setenv("API_SERVER_CERT_PATH", str(tmp_path / "nope.crt"))
+        monkeypatch.setenv("API_SERVER_KEY_PATH", str(tmp_path / "nope.key"))
+        monkeypatch.delenv("TRACKER_CA_CERT_PATH", raising=False)
+
+        with pytest.raises(RuntimeError, match="not found on disk"):
+            resolve_outbound_tls_config()
+
+
+class TestBuildOutboundSslContext:
+    """SSL context wiring from resolved config."""
+
+    def test_returns_none_for_http_url(self):
+        """Plain HTTP needs no TLS — caller passes None to urlopen unchanged."""
+        ctx = _build_outbound_ssl_context("http://sade.example.com/x", None)
+        assert ctx is None
+
+    def test_strict_verify_for_https_without_client_cert(self):
+        """HTTPS without a configured client cert: server-auth only, hostname checked."""
+        ctx = _build_outbound_ssl_context("https://sade.example.com/x", None)
+
+        assert isinstance(ctx, ssl.SSLContext)
+        assert ctx.check_hostname is True
+        assert ctx.verify_mode is ssl.CERT_REQUIRED
+
+    def test_loads_client_cert_when_configured(self, tmp_path: Path):
+        """Generate a self-signed pair and confirm load_cert_chain succeeds."""
+        # Build a real RSA keypair + self-signed cert so SSLContext.load_cert_chain
+        # accepts them — empty placeholder files would raise SSLError.
+        import subprocess
+
+        cert = tmp_path / "client.crt"
+        key = tmp_path / "client.key"
+        subprocess.run(
+            [
+                "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                "-days", "1", "-subj", "/CN=test-client",
+                "-keyout", str(key), "-out", str(cert),
+            ],
+            check=True, capture_output=True,
+        )
+
+        ctx = _build_outbound_ssl_context(
+            "https://sade.example.com/x",
+            {
+                "ca_cert_path": None,
+                "client_cert_path": str(cert),
+                "client_key_path": str(key),
+            },
+        )
+
+        assert isinstance(ctx, ssl.SSLContext)
+        # load_cert_chain doesn't expose the loaded cert directly, but
+        # get_ca_certs() and the absence of an exception during build
+        # confirm the cert/key were accepted.
+        assert ctx.verify_mode is ssl.CERT_REQUIRED

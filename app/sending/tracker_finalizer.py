@@ -19,6 +19,7 @@ import asyncio
 import json
 import logging
 import os
+import ssl
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -56,6 +57,94 @@ def get_tracker_finalized_url() -> str:
             "target environment."
         )
     return url
+
+
+# ── Outbound mTLS to SADE ─────────────────────────────────────────────────────
+# The Flight Monitor presents the same "systems" identity certificate to SADE
+# on outbound finalization POSTs that it presents to inbound clients on its
+# own API.  API_SERVER_CERT_PATH and API_SERVER_KEY_PATH are intentionally
+# reused so the operator configures one identity in one place.
+#
+# TRACKER_CA_CERT_PATH is independent — it's the CA used to verify SADE's
+# SERVER cert during the outbound handshake, which is a different concern
+# from API_CA_CERT_PATH (which verifies INBOUND CLIENT certs).  If
+# TRACKER_CA_CERT_PATH is unset, the system trust store is used.
+
+
+def resolve_outbound_tls_config() -> dict[str, str | None] | None:
+    """Resolve outbound mTLS config from env, or None if nothing configured.
+
+    Returns a dict shaped like
+        {"ca_cert_path": ..., "client_cert_path": ..., "client_key_path": ...}
+    when one or more of the three env vars is set, with None values for
+    any individual entry that was left unset.  Returns None when all
+    three env vars are unset (caller gets default-trust-store HTTPS).
+
+    Raises ``RuntimeError`` when:
+      - the client cert path is set but the key path isn't (or vice
+        versa); a half-configured client identity is almost always a
+        misconfiguration.
+      - any provided path does not exist on disk; better to surface a
+        wrong bind-mount at startup than as a confusing TLS handshake
+        error on the first finalize POST.
+    """
+    cert = (os.getenv("API_SERVER_CERT_PATH") or "").strip()
+    key = (os.getenv("API_SERVER_KEY_PATH") or "").strip()
+    ca = (os.getenv("TRACKER_CA_CERT_PATH") or "").strip()
+
+    if not (cert or key or ca):
+        return None
+
+    if bool(cert) != bool(key):
+        raise RuntimeError(
+            "Outbound mTLS is partially configured: API_SERVER_CERT_PATH "
+            "and API_SERVER_KEY_PATH must be set together when presenting "
+            f"a client cert to SADE.  Got cert={cert!r} key={key!r}."
+        )
+
+    missing = [p for p in (cert, key, ca) if p and not os.path.exists(p)]
+    if missing:
+        raise RuntimeError(
+            "Outbound mTLS cert path(s) not found on disk: "
+            f"{missing}.  Verify the bind-mount and path values."
+        )
+
+    return {
+        "ca_cert_path": ca or None,
+        "client_cert_path": cert or None,
+        "client_key_path": key or None,
+    }
+
+
+def _build_outbound_ssl_context(
+    url: str,
+    tls_config: dict[str, str | None] | None,
+) -> ssl.SSLContext | None:
+    """Build an SSL context for an outbound POST, or None for http:// URLs.
+
+    Verification is always strict (hostname check + CERT_REQUIRED).  A
+    custom CA bundle is loaded when ``tls_config["ca_cert_path"]`` is
+    set; otherwise the system trust store is used.  A client cert is
+    attached when both cert and key paths are set in ``tls_config``.
+
+    ``urlopen`` ignores the context for plain-http URLs, but we return
+    None there to make the http vs. https code paths obvious to a reader.
+    """
+    if not url.lower().startswith("https://"):
+        return None
+
+    ca = (tls_config or {}).get("ca_cert_path")
+    cert = (tls_config or {}).get("client_cert_path")
+    key = (tls_config or {}).get("client_key_path")
+
+    ctx = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH, cafile=ca)
+    ctx.check_hostname = True
+    ctx.verify_mode = ssl.CERT_REQUIRED
+
+    if cert and key:
+        ctx.load_cert_chain(cert, key)
+
+    return ctx
 
 
 def _build_battery_state(voltage: float | None) -> dict[str, Any]:
@@ -301,6 +390,11 @@ async def _attempt_post(payload: dict[str, Any], url: str) -> dict[str, Any]:
 
     Raises ``urllib.error.HTTPError`` on non-2xx responses and any other
     exception on network/transport failures.
+
+    Builds an outbound SSL context per attempt so a cert rotation does not
+    require a process restart; cost is a few microseconds versus the
+    network round-trip dominating the call.  Returns None context for
+    http:// URLs (plain HTTP, unchanged behaviour).
     """
     data = json.dumps(payload).encode()
     request = urllib.request.Request(
@@ -310,8 +404,11 @@ async def _attempt_post(payload: dict[str, Any], url: str) -> dict[str, Any]:
         method="POST",
     )
 
+    tls_config = resolve_outbound_tls_config()
+    ssl_context = _build_outbound_ssl_context(url, tls_config)
+
     def _do_post() -> dict[str, Any]:
-        with urllib.request.urlopen(request, timeout=10) as resp:
+        with urllib.request.urlopen(request, timeout=10, context=ssl_context) as resp:
             return json.loads(resp.read())
 
     return await asyncio.to_thread(_do_post)

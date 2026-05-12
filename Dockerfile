@@ -83,11 +83,34 @@ ENV MISSION_ROWS_OUT=""
 ENV API_HOST=0.0.0.0 \
     API_PORT=8000
 
+# ── Inbound API mTLS ─────────────────────────────────────────────────────────
+# All three of API_CA_CERT_PATH / API_SERVER_CERT_PATH / API_SERVER_KEY_PATH
+# must be set together to enable inbound mTLS on the FastAPI endpoints;
+# leaving all three unset serves plain HTTP.  Intentionally NOT given
+# defaults here — every deployment that wants mTLS must set them
+# explicitly so we don't silently fall back to plain HTTP when a bind
+# mount is misconfigured.  Mount cert files via:
+#     docker run -v /host/api-certs:/api-certs:ro ...
+# or via ECS task definition secrets / AWS Secrets Manager.  NEVER COPY
+# the private key into the image — it would persist in the layer
+# history forever.
+
+# ── Outbound mTLS to SADE ────────────────────────────────────────────────────
+# The Flight Monitor's identity cert (API_SERVER_CERT_PATH +
+# API_SERVER_KEY_PATH above) is reused as the client cert presented to
+# SADE on outbound /tracker-session-finalized POSTs — one "systems" cert,
+# one place to configure it.  TRACKER_CA_CERT_PATH is independent: it's
+# the CA used to verify SADE's SERVER cert during the outbound
+# handshake.  Leave unset to use the system trust store (correct for
+# publicly-trusted SADE endpoints).  Set when SADE uses an internal CA.
+
 # ── Expose ────────────────────────────────────────────────────────────────────
 # FastAPI webhook server:
 #   POST /flight-monitor/register-session  (session registration)
 #   POST /flight-monitor/exit-request      (exit notification)
 #   GET  /health                           (liveness check)
+#   GET  /dashboard                        (live drone-status web page)
+# Same port whether mTLS is on or off — schema differs (http vs https).
 EXPOSE 8000
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────

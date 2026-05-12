@@ -42,3 +42,4 @@ mission_rows.csv
 .vscode/
 *.swp
 *.swo
+local_testing/api-certs/
