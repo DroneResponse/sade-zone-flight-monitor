@@ -292,6 +292,16 @@ docker run --rm -p 8000:8000 \
 
 `/health` is available at `http://localhost:8000/health` once the container starts.
 
+### Run with `docker compose` — broker + service together
+
+For self-contained local-stack testing with no host-installed broker:
+
+```bash
+docker compose up --build
+```
+
+Brings up an Eclipse Mosquitto broker on port `1883` and the Flight Monitor on port `8000`, wired together over the default compose network. The service defaults to `SESSION_SOURCE_MODE=local` and `FINALIZE_TO_API=false`, so any drone that publishes telemetry to the local broker gets a synthetic session and the pipeline never tries to POST to SADE. Override either via inline `-e` or by editing `docker-compose.yml`. Mosquitto's `allow_anonymous true` config lives at [local_testing/mosquitto.conf](local_testing/mosquitto.conf) and is bind-mounted into the broker container.
+
 ### Run in production / AWS
 
 > **Breaking change (2026-04-22):** `TRACKER_FINALIZED_URL` is now a required env var whenever `FINALIZE_TO_API=true` (the container default). The previous release's hardcoded AWS ALB URL has been removed, and the container will **fail to start** if this variable is unset while finalization is enabled. Set it explicitly for every environment you deploy to (see the example below).
@@ -489,14 +499,11 @@ The CSV writer was built for local observation and debugging. The finalization A
 **Worker count tuning**
 The pipeline defaults to 1 async worker. The `scripts/run_worker_comparison.py` benchmark showed diminishing returns beyond 1–2 workers at current message rates since the bottleneck is I/O bound, but this should be validated under real production load with concurrent drones.
 
-**No `docker-compose.yml` for local full-stack testing**
-A `Dockerfile` exists and the image builds and runs. A `docker-compose.yml` that spins up Mosquitto + this service together would make local Docker-based testing self-contained without needing a host-installed broker.
-
 **Mission-plan integration**
-`app/missions/` is a placeholder. The drone simulator uses static waypoint JSON files but the production service has no awareness of planned vs. actual flight paths. Distance flown, route deviation, and waypoint compliance are not computed.
+`app/missions/` is a placeholder. The drone simulator uses static waypoint JSON files but the production service has no awareness of planned vs. actual flight paths. Route deviation and waypoint compliance are not computed (basic total distance flown is — via haversine accumulation in `DroneStateTracker`).
 
-**Exit-policy redesign (planned)**
-Gap (1) — drones self-closing sessions via terminal MQTT — has been resolved: terminal MQTT now writes only the local CSV row and leaves the session alive for SADE to close. Gap (2) — a session that never receives an exit-request and goes silent leaks in memory until process restart — is still open. The planned next step is a periodic sweeper that flags sessions past `requested_exit_time_utc` without an exit-request, flags sessions with prolonged telemetry silence, and (later) force-finalizes as a memory-safety backstop. Full plan, data-flow comparison, and rollout notes in [docs/EXIT_POLICY_DESIGN.md](docs/EXIT_POLICY_DESIGN.md).
+**Sweeper-based session backstop** *(implemented)*
+Sessions that never receive an exit-request used to leak in memory until process restart. A periodic background sweeper now scans the registry every 60 s and (1) flags sessions past `requested_exit_time` without an exit-request as `exit_deadline_breached_at`, (2) flags sessions whose telemetry has been silent >10 min without an exit-request as `stranded_flagged_at`, and (3) force-closes any session that has been carrying a flag for >24 h via the canonical finalize sequence. Both flags are one-shot edge detectors and surfaced on `/health` as `sessions_past_deadline` / `sessions_stranded`. Terminal MQTT statuses still do not close sessions — SADE owns finalization. Trigger/timing details in [SADE_AWS_API_INFORMATION/FLIGHT_MONITOR_CONTRACT.md](SADE_AWS_API_INFORMATION/FLIGHT_MONITOR_CONTRACT.md); original design narrative in [docs/EXIT_POLICY_DESIGN.md](docs/EXIT_POLICY_DESIGN.md).
 
 **Incident detection**
 `INCIDENT` events are defined in [SADE_AWS_API_INFORMATION/REFERENCE_TABLES.md](SADE_AWS_API_INFORMATION/REFERENCE_TABLES.md) with a standard `hhhh-sss` code format, but the Flight Monitor does not yet emit any. Detection of the relevant incident categories (airspace violation, loss-of-control, battery failure, etc.) requires a signal-to-code mapping that is not yet specified.

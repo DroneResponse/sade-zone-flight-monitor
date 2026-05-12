@@ -1,0 +1,56 @@
+# Local full-stack development compose file.
+#
+# Brings up an Eclipse Mosquitto broker and the Flight Monitor together on
+# the default compose network so the service can resolve the broker by
+# service name (mosquitto:1883) without needing a host-installed broker.
+#
+# Defaults are tuned for self-contained local testing:
+#   - SESSION_SOURCE_MODE=local   → any drone that publishes gets a session
+#   - FINALIZE_TO_API=false       → no outbound POST to SADE; no URL needed
+#   - MQTT_TLS_ENABLED=false      → unauthenticated broker on port 1883
+#
+# Override any of the above via inline `-e` flags or by editing the
+# `environment:` block below. For production deployments use `docker run`
+# with the env vars documented in README.md instead — this file is NOT
+# suitable for anything reachable beyond the local machine.
+#
+# Usage:
+#   docker compose up --build           # foreground, with logs
+#   docker compose up -d --build        # detached
+#   docker compose down                 # tear down
+
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: sade-mosquitto
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./local_testing/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    healthcheck:
+      # mosquitto_pub returns 0 when the broker accepts the CONNECT; this
+      # is cheaper and more reliable than subscribing to $SYS/#.
+      test: ["CMD-SHELL", "mosquitto_pub -h localhost -t healthcheck -m '' -i hc -q 0 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 3s
+
+  flight-monitor:
+    build: .
+    container_name: sade-flight-monitor
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      # Broker: resolve the sibling service by compose DNS name.
+      MQTT_BROKER_HOST: mosquitto
+      MQTT_BROKER_PORT: "1883"
+      MQTT_TLS_ENABLED: "false"
+      MQTT_TOPIC: "status_message,update_drone"
+      # Local-test defaults — see header comment for the rationale.
+      SESSION_SOURCE_MODE: local
+      FINALIZE_TO_API: "false"
+      LOG_LEVEL: INFO

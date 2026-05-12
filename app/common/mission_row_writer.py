@@ -16,11 +16,20 @@ from app.monitoring.mission_row_schema import ALL_COLUMNS
 
 
 class MissionCsvWriter:
-    """Append mission summary rows to a local CSV file."""
+    """Append mission summary rows to a local CSV file.
+
+    An empty ``out_path`` disables CSV output entirely — both header
+    creation and ``write_row`` become no-ops.  This matches the
+    ``MISSION_ROWS_OUT=""`` convention documented in ``.env.example``
+    and the Dockerfile (CSV is a diagnostic-only output; the SADE
+    finalize POST is the production path).
+    """
 
     def __init__(self, out_path: str) -> None:
         self.out_path = out_path
         self._lock = Lock()
+        if not self.out_path:
+            return
         self._ensure_csv_header()
 
     def _ensure_csv_header(self) -> None:
@@ -34,6 +43,9 @@ class MissionCsvWriter:
 
     def write_row(self, row: dict[str, Any]) -> None:
         """Append one schema-complete row to the local CSV file."""
+        if not self.out_path:
+            return
+
         row_to_write = dict(row)
 
         for key in ALL_COLUMNS:

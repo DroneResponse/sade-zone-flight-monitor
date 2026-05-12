@@ -21,6 +21,7 @@ import argparse
 import asyncio
 import logging
 import os
+from typing import Any, Callable
 
 from app.monitoring.active_session_registry import ActiveSessionRegistry
 from app.monitoring.mission_row_builder import MissionRowBuilder
@@ -426,6 +427,47 @@ async def run_pipeline(args: argparse.Namespace) -> None:
         )
 
 
+def _make_pipeline_done_handler(
+    server: Any,
+) -> Callable[[asyncio.Task], None]:
+    """Return a done-callback that stops uvicorn when the pipeline dies.
+
+    ``run_service`` runs the MQTT pipeline as a fire-and-forget asyncio
+    task whose exception is only retrieved when we await it during
+    shutdown.  Without this callback, a pipeline crash leaves uvicorn
+    happily serving ``/health`` while no telemetry is being processed —
+    the worst kind of partial failure because health checks look green.
+
+    Attaching this handler via ``Task.add_done_callback`` flips
+    ``server.should_exit`` so uvicorn gracefully tears itself down on
+    pipeline failure, surfacing the crash via process exit instead of
+    silently degrading.
+
+    ``server`` is typed as ``Any`` so the pipeline-only path in
+    ``run_pipeline`` doesn't have to import uvicorn — only ``run_service``
+    constructs one.
+    """
+    def _on_done(task: asyncio.Task) -> None:
+        if task.cancelled():
+            # Expected during clean shutdown: ``run_service``'s finally
+            # block cancels the task on its way out.
+            return
+        exc = task.exception()
+        if exc is None:
+            LOGGER.error(
+                "MQTT pipeline task exited unexpectedly without an exception "
+                "— shutting down the API server."
+            )
+        else:
+            LOGGER.error(
+                "MQTT pipeline task crashed — shutting down the API server.",
+                exc_info=exc,
+            )
+        server.should_exit = True
+
+    return _on_done
+
+
 async def run_service(args: argparse.Namespace) -> None:
     """Run the FastAPI webhook server and the MQTT pipeline together.
 
@@ -461,11 +503,6 @@ async def run_service(args: argparse.Namespace) -> None:
         args.finalize_to_api,
     )
 
-    # Run the MQTT pipeline as a background asyncio task.
-    pipeline_task = asyncio.create_task(run_pipeline(args), name="mqtt-pipeline")
-
-    # Uvicorn serves the FastAPI app in the foreground.  When it exits (Ctrl-C
-    # or SIGTERM), we cancel the pipeline task so everything shuts down cleanly.
     config = uvicorn.Config(
         fastapi_app,
         host=args.api_host,
@@ -474,11 +511,30 @@ async def run_service(args: argparse.Namespace) -> None:
     )
     server = uvicorn.Server(config)
 
+    # Run the MQTT pipeline as a background asyncio task.  The done-callback
+    # signals uvicorn to shut down if the pipeline crashes, so a partial
+    # failure (API up, pipeline dead) surfaces as process exit instead of
+    # a silently green /health.
+    pipeline_task = asyncio.create_task(run_pipeline(args), name="mqtt-pipeline")
+    pipeline_task.add_done_callback(_make_pipeline_done_handler(server))
+
     try:
+        # Uvicorn serves the FastAPI app in the foreground.  When it exits
+        # (Ctrl-C, SIGTERM, or the done-callback above), we cancel the
+        # pipeline task so everything shuts down cleanly.
         await server.serve()
     finally:
         pipeline_task.cancel()
         await asyncio.gather(pipeline_task, return_exceptions=True)
+
+    # If the pipeline crashed (as opposed to being cancelled on a clean
+    # shutdown), re-raise so the process exits non-zero.  Container
+    # orchestrators read a zero exit as "task complete, do not restart",
+    # which is the wrong signal for a service whose pipeline died.
+    if not pipeline_task.cancelled():
+        pipeline_exc = pipeline_task.exception()
+        if pipeline_exc is not None:
+            raise pipeline_exc
 
 
 def main() -> int:
@@ -495,6 +551,16 @@ def main() -> int:
         asyncio.run(run_service(args))
     except KeyboardInterrupt:
         LOGGER.info("Interrupted by user")
+    except Exception:
+        # Pipeline-task crashes are already logged with a traceback by the
+        # done-callback in run_service.  Log here too so any other
+        # startup-phase exception that bypasses the callback always
+        # reaches the operator instead of disappearing into the
+        # asyncio-run unwind.  Cost: one duplicate traceback on pipeline
+        # crashes — acceptable for guaranteed coverage on every other
+        # failure mode.
+        LOGGER.exception("Service startup failed")
+        return 1
 
     return 0
 

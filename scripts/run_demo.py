@@ -462,10 +462,9 @@ async def start_pipeline_task(api_port: int) -> asyncio.Task:
     import app.api.server as srv
     import app.main as ingestion_main
 
-    # MissionCsvWriter requires a writeable path — passing "" crashes the
-    # pipeline at startup with FileNotFoundError before any subscribe
-    # happens.  Route the CSV to a tempfile so the demo doesn't litter
-    # the repo root with mission_rows.csv either.
+    # Route diagnostic CSV to a tempfile so demo runs don't litter the
+    # repo root with mission_rows.csv.  Set to "" to disable CSV output
+    # entirely if you don't care about inspecting the rows.
     csv_path = str(Path(tempfile.gettempdir()) / "sade_demo_mission_rows.csv")
 
     pipeline_args = SimpleNamespace(
