@@ -8,6 +8,8 @@ This service is the **flight monitor / telemetry tracker** component of the SADE
 
 The finalization payload follows the schema in [SADE_AWS_API_INFORMATION/SADE_CONTRACT.md](SADE_AWS_API_INFORMATION/SADE_CONTRACT.md): top-level `telemetry_summary` (altitude min/max + `distance_flown_m`) plus an `events` array of `FLIGHT_SEGMENT` / `EXIT_REQUEST` / `INCIDENT` entries. Per-segment battery state carries `system_charge_pct` plus a `slots[]` array of `{slot_id, voltage_v}` to support multi-slot drones.
 
+> **Looking for the exact wire-level shapes** for every webhook, MQTT telemetry, and the outbound finalization POST? See [docs/MESSAGE_SHAPES.md](docs/MESSAGE_SHAPES.md) for a single annotated reference.
+
 The service does **not** make entry decisions. That is SADE's job. This service only watches flights that SADE has already approved, records what actually happened, and reports back what is monitored.
 
 
